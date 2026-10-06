@@ -1,0 +1,4 @@
+# 运行本项目所需的第三方依赖
+# 安装：pip install -r requirements.txt
+
+PyMySQL>=1.1.0
