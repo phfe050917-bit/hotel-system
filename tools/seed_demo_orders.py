@@ -1,21 +1,24 @@
 """
-生成订单类演示数据。
+生成客房订单、团体单与支付流水的演示数据。
 
 用法：python tools/seed_demo_orders.py
 
 设计要点：
   · 订单**不写进 SQL 脚本**，而是通过 app/service.py 创建 —— 这样演示数据
     一定会走过触发器、状态机、金额汇总与事务校验，保证数据自洽；
+  · 只生成客房订单（单号 RM 前缀）、结账单（JS 前缀）与支付流水（PY 前缀），
+    不再涉及餐饮 / 健身 / SPA / 洗衣等已删除的业务线；
+  · 包含一段**团体演示**（3 间房 → 整团入住 → 一张结账单结清），
+    对应题目要求 (1) 的"团体登记和团体结账"；
   · 幂等：先用固定前缀检测是否已生成，已存在则跳过（可用 --force 强制重建）；
-  · 覆盖各种状态（待入住 / 在住 / 已退房 / 已取消 / 待收款 / 已支付 / 已评价），
-    便于答辩时演示各功能；
+  · 覆盖各种状态（待入住 / 在住 / 已退房 / 已取消 / 待收款 / 已支付 / 已评价 /
+    团体已结账），便于答辩时演示各功能；
   · 所有日期基于"今天"计算，任何时候运行都能看到合理的今日数据。
 """
 
 from __future__ import annotations
 
 import argparse
-import io
 import sys
 from datetime import date, timedelta
 from pathlib import Path
@@ -61,7 +64,7 @@ def seed(db: Database) -> None:
     # ---------------------------------------------------------------
     # 1. 客房订单：覆盖 待入住 / 在住 / 已退房 / 已取消 / 已支付 / 未支付
     # ---------------------------------------------------------------
-    print("\n[1/6] 客房订单")
+    print("\n[1/3] 客房订单")
 
     # 在住：昨天入住，后天离店（allow_past 供演示/前台查询已入住房间）
     rooms = service.search_available_rooms(db, TODAY - timedelta(days=1),
@@ -130,95 +133,56 @@ def seed(db: Database) -> None:
             _try("  取消订单", service.cancel_order, db, "room", order["order_id"])
 
     # ---------------------------------------------------------------
-    # 2. 餐饮订单（带菜品明细，验证金额自动汇总）
+    # 2. 团体登记 → 整团入住 → 团体结账（题目要求 (1)）
+    #    「一次登记多间房」和「一张结账单结清多间房」这两件事，
+    #    在数据上分别对应 room_order.group_id 与 room_order.settlement_no。
     # ---------------------------------------------------------------
-    print("\n[2/6] 餐饮订单")
-    for restaurant_id, hour, count, dish_indexes in (
-        (1, "12:00", 2, [0, 2]),
-        (1, "18:30", 4, [4, 5, 6]),
-        (2, "19:00", 2, [0, 1]),
-    ):
-        menu = service.list_menu(db, restaurant_id)
-        dishes = [d for d in menu if float(d["price"]) > 0]
-        if len(dishes) <= max(dish_indexes):
-            continue
-        items = [(dishes[i]["dish_id"], 1 + i % 2) for i in dish_indexes]
-        order = _try(f"创建餐饮订单（餐厅{restaurant_id} {hour}，{len(items)} 道菜）",
-                     service.create_dining_order, db, user_id=guest_id,
-                     restaurant_id=restaurant_id, dining_date=TODAY,
-                     dining_time=hour, guest_count=count, items=items)
-        if order and hour == "12:00":
-            _try("  标记完成用餐", service.advance_order_status, db, "dining",
-                 order["order_id"], "completed")
-            _try("  收款", service.pay_order, db, order_type="dining",
-                 order_id=order["order_id"], user_id=guest_id, method="alipay")
-            _try("  提交评价", service.submit_review, db, user_id=guest_id,
-                 order_id=order["order_id"], order_type="dining", rating=4,
-                 content="宫保鸡丁味道正宗，上菜速度也快。")
+    print("\n[2/3] 团体登记与团体结账")
+
+    booker = db.query_value("SELECT user_id FROM `user` WHERE username = 'reception'",
+                            None, 0)
+    group_in = TODAY
+    group_out = TODAY + timedelta(days=2)
+    group_rooms = (service.search_available_rooms(db, group_in, group_out)[:3]
+                   if booker else [])
+    if len(group_rooms) < 3:
+        _log("– 跳过团体演示：未找到前台账号或当天可用房不足 3 间")
+    else:
+        group = _try("登记 3 间房的团体单「华东区经销商年会」",
+                     service.create_group_booking, db,
+                     group_name="华东区经销商年会", contact_name="王经理",
+                     contact_phone="13900000009", id_card="310101198505051234",
+                     booker_user_id=int(booker), leader_user_id=guest_id,
+                     check_in=group_in, check_out=group_out,
+                     room_ids=[r["room_id"] for r in group_rooms],
+                     remark="演示：团体登记 / 整团入住 / 团体结账")
+        if group:
+            _log(f"    团体单号 {group['group_id']}：{group['room_count']} 间房 · "
+                 f"{group['nights']} 晚 · 总额 ¥{group['total_price']:,.2f}")
+            _try("  整团办理入住（触发器把房间置为在住）",
+                 service.checkin_group, db, group["group_id"])
+            bill = _try("  团体结账（一张结账单覆盖 3 间房）",
+                        service.settle_group, db, group_id=group["group_id"],
+                        method="card", operator_id=int(booker),
+                        remark="演示：团体结账")
+            if bill:
+                _log(f"    结账单号 {bill['settlement_no']}：{bill['room_count']} 间房 · "
+                     f"账单 ¥{bill['total_amount']:,.2f} · "
+                     f"实收 ¥{bill['collected']:,.2f}")
+                _try("  按姓名/手机号/房间号/订单号查询客人信息",
+                     service.search_guest_profile, db, keyword="王经理")
 
     # ---------------------------------------------------------------
-    # 3. 健身预约
+    # 3. 再注册一个客人账号，让列表里有多个用户
     # ---------------------------------------------------------------
-    print("\n[3/6] 健身预约")
-    facilities = db.query("SELECT facility_id, facility_name, capacity "
-                          "FROM fitness_facility WHERE status='available' "
-                          "ORDER BY facility_id LIMIT 2")
-    for index, facility in enumerate(facilities):
-        _try(f"预约 {facility['facility_name']}",
-             service.create_fitness_booking, db, user_id=guest_id,
-             facility_id=facility["facility_id"], booking_date=TODAY,
-             time_slot=service.FITNESS_SLOTS[index], guest_count=1 + index)
-
-    # ---------------------------------------------------------------
-    # 4. SPA 预约（同时占用技师排班表）
-    # ---------------------------------------------------------------
-    print("\n[4/6] SPA 预约")
-    services = db.query("SELECT service_id, service_name FROM spa_service "
-                        "ORDER BY service_id LIMIT 2")
-    for index, spa in enumerate(services):
-        techs = service.list_technicians(db, spa["service_id"])
-        if not techs:
-            continue
-        target_tech = techs[index % len(techs)]
-        target_date = TODAY + timedelta(days=index)
-        taken = {row["time_slot"] for row in service.tech_availability(
-            db, target_tech["tech_id"], target_date) if row["is_booked"]}
-        slot = next((f"{h:02d}:00" for h in range(9, 21)
-                     if f"{h:02d}:00" not in taken), None)
-        if slot is None:
-            continue
-        _try(f"预约 {spa['service_name']}（{target_tech['tech_name']} {slot}）",
-             service.create_spa_booking, db, user_id=guest_id,
-             service_id=spa["service_id"], tech_id=target_tech["tech_id"],
-             booking_date=target_date, booking_time=slot)
-
-    # ---------------------------------------------------------------
-    # 5. 洗衣订单（加急与普通各一，验证优先级排序）
-    # ---------------------------------------------------------------
-    print("\n[5/6] 洗衣订单")
-    for service_type, count, pickup in (("wash", 4, "09:00"),
-                                        ("express_dry", 2, "立即取衣")):
-        order = _try(f"创建洗衣订单（{service_type} × {count}）",
-                     service.create_laundry_order, db, user_id=guest_id,
-                     service_type=service_type, item_count=count,
-                     room_number="", expected_pickup=pickup)
-        if order and service_type == "wash":
-            _try("  标记已取衣", service.advance_order_status, db, "laundry",
-                 order["order_id"], "picked_up")
-            _try("  标记洗涤中", service.advance_order_status, db, "laundry",
-                 order["order_id"], "processing")
-
-    # ---------------------------------------------------------------
-    # 6. 再注册一个客人账号，让列表里有多个用户
-    # ---------------------------------------------------------------
-    print("\n[6/6] 补充演示账号")
+    print("\n[3/3] 补充演示账号")
     _try("注册演示账号 guest02",
          service.register_guest, db, "guest02", "guest123", "guest123",
          "13800000004", "李四")
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="生成订单类演示数据")
+    parser = argparse.ArgumentParser(description="生成客房订单与支付流水演示数据")
     parser.add_argument("--force", action="store_true",
                         help="即使已有演示订单也继续追加")
     args = parser.parse_args()
@@ -227,13 +191,17 @@ def main() -> int:
     try:
         existing = db.query_value(
             "SELECT COUNT(*) FROM room_order WHERE guest_name = '张三'", None, 0)
-        if existing and not args.force:
-            print(f"检测到已有 {existing} 条演示客房订单，跳过。"
+        demo_group = db.query_value(
+            "SELECT COUNT(*) FROM guest_group WHERE group_name = '华东区经销商年会'",
+            None, 0)
+        if (existing or demo_group) and not args.force:
+            print(f"检测到已有 {existing} 条演示客房订单、{demo_group} 个演示团体单，跳过。"
                   f"（如需追加请加 --force）")
             return 0
 
         print("=" * 60)
-        print("  生成订单类演示数据（全部通过业务层创建，会走触发器与校验）")
+        print("  生成客房订单 / 团体单 / 结账单 / 支付流水演示数据"
+              "（全部通过业务层创建，会走触发器与校验）")
         print("=" * 60)
         seed(db)
         print("\n" + "=" * 60)

@@ -23,10 +23,7 @@ from typing import Callable, TypeVar
 _ALPHABET = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"
 _PREFIXES = {
     "room": "RM",
-    "dining": "DN",
-    "fitness": "FT",
-    "spa": "SP",
-    "laundry": "LN",
+    "settlement": "JS",
     "payment": "PY",
 }
 

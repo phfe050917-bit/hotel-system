@@ -5,27 +5,31 @@
 --  依赖   : 01_schema.sql
 --
 --  设计意图：
---    原系统的"订单汇总"是在 Python 里把 5 张订单表查出来，再用
---    CASE 语句把状态翻译成中文，然后合并排序。这段逻辑在三端各写了
---    一遍，而且客人端还用"秒级时间戳作二叉搜索树键"来排序，导致同一
---    秒创建的多张订单互相覆盖、界面静默丢单。
+--    原系统的"订单汇总"是在 Python 里把订单表查出来，再用 CASE 语句把
+--    状态翻译成中文，然后合并排序。这段逻辑在三端各写了一遍，而且客人端
+--    还用"秒级时间戳作二叉搜索树键"来排序，导致同一秒创建的多张订单互相
+--    覆盖、界面静默丢单。
 --
---    现在把"跨表 UNION + 状态归一 + 排序"全部下沉到视图，
---    三端统一调用 v_all_orders，重复代码消失、丢单 bug 从根上消除。
+--    现在把"状态归一 + 排序"全部下沉到视图，三端统一调用 v_all_orders，
+--    重复代码消失、丢单 bug 从根上消除。
+--    （本版本按题目要求只保留客房业务，视图结构保持不变，便于后续扩展。）
 -- =====================================================================
 
 USE `hotel_booking`;
 
+DROP VIEW IF EXISTS `v_guest_profile`;
+DROP VIEW IF EXISTS `v_settlement_detail`;
 DROP VIEW IF EXISTS `v_all_orders`;
 DROP VIEW IF EXISTS `v_room_availability`;
 DROP VIEW IF EXISTS `v_room_current_state`;
 DROP VIEW IF EXISTS `v_daily_revenue`;
 DROP VIEW IF EXISTS `v_service_stats`;
+-- 历史视图：属于已移除的 SPA 业务线，这里保留 DROP 以便旧库升级后不留残留
 DROP VIEW IF EXISTS `v_tech_schedule_today`;
 
 
 -- ---------------------------------------------------------------------
---  V1. 全量订单视图（跨 5 张订单表 UNION ALL + 状态归一化）
+--  V1. 客房订单视图（状态归一化视图）
 --
 --  对外统一三个概念，三端界面不再各自翻译状态：
 --    status_group    : 归一化分组 pending / active / completed / cancelled
@@ -64,144 +68,15 @@ SELECT
         WHEN 'checked_out' THEN '已完成'
         ELSE '已取消'
     END                                             AS status_category,
+    ro.group_id                                     AS group_id,
+    gg.group_name                                   AS group_name,
+    ro.settlement_no                                AS settlement_no,
     ro.check_in_date                                AS service_date,
     ro.created_at                                   AS created_at
 FROM room_order ro
 JOIN `user` u ON u.user_id = ro.user_id
 JOIN room   r ON r.room_id = ro.room_id
-
-UNION ALL
-
-SELECT
-    d.order_id, d.user_id, u.username,
-    'dining', '餐饮',
-    CONCAT(rs.restaurant_name, ' / ', DATE_FORMAT(d.dining_date, '%Y-%m-%d'),
-           ' ', TIME_FORMAT(d.dining_time, '%H:%i'),
-           ' / ', d.guest_count, '位'),
-    d.total_price, d.status,
-    CASE d.status
-        WHEN 'confirmed' THEN 'pending'
-        WHEN 'dining'    THEN 'active'
-        WHEN 'completed' THEN 'completed'
-        ELSE 'cancelled'
-    END,
-    CASE d.status
-        WHEN 'confirmed' THEN '待用餐'
-        WHEN 'dining'    THEN '用餐中'
-        WHEN 'completed' THEN '已完成'
-        ELSE '已取消'
-    END,
-    CASE d.status
-        WHEN 'confirmed' THEN '进行中'
-        WHEN 'dining'    THEN '进行中'
-        WHEN 'completed' THEN '已完成'
-        ELSE '已取消'
-    END,
-    d.dining_date, d.created_at
-FROM dining_order d
-JOIN `user` u    ON u.user_id = d.user_id
-JOIN restaurant rs ON rs.restaurant_id = d.restaurant_id
-
-UNION ALL
-
-SELECT
-    fb.booking_id, fb.user_id, u.username,
-    'fitness', '健身',
-    CONCAT(ff.facility_name, ' / ', DATE_FORMAT(fb.booking_date, '%Y-%m-%d'),
-           ' ', fb.time_slot, ' / ', fb.guest_count, '人'),
-    0.00, fb.status,
-    CASE fb.status
-        WHEN 'confirmed' THEN 'pending'
-        WHEN 'completed' THEN 'completed'
-        ELSE 'cancelled'
-    END,
-    CASE fb.status
-        WHEN 'confirmed' THEN '已预约'
-        WHEN 'completed' THEN '已完成'
-        ELSE '已取消'
-    END,
-    CASE fb.status
-        WHEN 'confirmed' THEN '进行中'
-        WHEN 'completed' THEN '已完成'
-        ELSE '已取消'
-    END,
-    fb.booking_date, fb.created_at
-FROM fitness_booking fb
-JOIN `user` u             ON u.user_id = fb.user_id
-JOIN fitness_facility ff  ON ff.facility_id = fb.facility_id
-
-UNION ALL
-
-SELECT
-    sb.booking_id, sb.user_id, u.username,
-    'spa', 'SPA',
-    CONCAT(ss.service_name, ' / ', t.tech_name, ' / ',
-           DATE_FORMAT(sb.booking_date, '%Y-%m-%d'), ' ',
-           TIME_FORMAT(sb.booking_time, '%H:%i'), ' / ',
-           ss.duration, '分钟'),
-    sb.price, sb.status,
-    CASE sb.status
-        WHEN 'confirmed'   THEN 'pending'
-        WHEN 'in_progress' THEN 'active'
-        WHEN 'completed'   THEN 'completed'
-        ELSE 'cancelled'
-    END,
-    CASE sb.status
-        WHEN 'confirmed'   THEN '待服务'
-        WHEN 'in_progress' THEN '服务中'
-        WHEN 'completed'   THEN '已完成'
-        ELSE '已取消'
-    END,
-    CASE sb.status
-        WHEN 'confirmed'   THEN '进行中'
-        WHEN 'in_progress' THEN '进行中'
-        WHEN 'completed'   THEN '已完成'
-        ELSE '已取消'
-    END,
-    sb.booking_date, sb.created_at
-FROM spa_booking sb
-JOIN `user` u       ON u.user_id = sb.user_id
-JOIN spa_service ss ON ss.service_id = sb.service_id
-JOIN technician t   ON t.tech_id = sb.tech_id
-
-UNION ALL
-
-SELECT
-    lo.order_id, lo.user_id, u.username,
-    'laundry', '洗衣',
-    CONCAT(CASE lo.service_type
-               WHEN 'wash'         THEN '普通水洗'
-               WHEN 'dry_clean'    THEN '普通干洗'
-               WHEN 'iron'         THEN '熨烫'
-               WHEN 'express_wash' THEN '加急水洗'
-               WHEN 'express_dry'  THEN '加急干洗'
-           END,
-           ' / 房间', lo.room_number, ' / ', lo.item_count, '件'),
-    lo.total_price, lo.status,
-    CASE lo.status
-        WHEN 'pending'    THEN 'pending'
-        WHEN 'picked_up'  THEN 'active'
-        WHEN 'processing' THEN 'active'
-        WHEN 'delivered'  THEN 'completed'
-        ELSE 'cancelled'
-    END,
-    CASE lo.status
-        WHEN 'pending'    THEN '等待取衣'
-        WHEN 'picked_up'  THEN '已取衣'
-        WHEN 'processing' THEN '洗涤中'
-        WHEN 'delivered'  THEN '已送达'
-        ELSE '已取消'
-    END,
-    CASE lo.status
-        WHEN 'pending'    THEN '进行中'
-        WHEN 'picked_up'  THEN '进行中'
-        WHEN 'processing' THEN '进行中'
-        WHEN 'delivered'  THEN '已完成'
-        ELSE '已取消'
-    END,
-    DATE(lo.created_at), lo.created_at
-FROM laundry_order lo
-JOIN `user` u ON u.user_id = lo.user_id;
+LEFT JOIN guest_group gg ON gg.group_id = ro.group_id;
 
 
 -- ---------------------------------------------------------------------
@@ -282,10 +157,6 @@ SELECT
     p.order_type                                    AS order_type,
     CASE p.order_type
         WHEN 'room'    THEN '客房'
-        WHEN 'dining'  THEN '餐饮'
-        WHEN 'fitness' THEN '健身'
-        WHEN 'spa'     THEN 'SPA'
-        WHEN 'laundry' THEN '洗衣'
     END                                             AS type_label,
     COUNT(*)                                        AS payment_count,
     SUM(p.amount)                                   AS revenue
@@ -295,7 +166,7 @@ GROUP BY DATE(p.paid_at), p.order_type;
 
 
 -- ---------------------------------------------------------------------
---  V5. 服务统计视图（各业务线订单量与金额一览，供管理端看板）
+--  V5. 订单统计视图（客房订单量与金额一览，供管理端看板）
 -- ---------------------------------------------------------------------
 CREATE VIEW `v_service_stats` AS
 SELECT
@@ -311,21 +182,98 @@ GROUP BY order_type, type_label;
 
 
 -- ---------------------------------------------------------------------
---  V6. 今日技师排班视图
+--  V6. 客人档案视图（题目要求 (3)：提供多种手段查询客人的信息）
 --
---  原系统 tech_schedule 建了表却零读写。本视图把排班与技师信息结合，
---  并标出每档是否已被 SPA 预约占用，使该表真正可用。
+--  以 user 为主体、LEFT JOIN 客房订单，因此"没下过单的客人"也能查到。
+--  一条订单一行；供 service.search_guest_profile() 按
+--  姓名 / 手机号 / 证件号 / 房间号 / 订单号 / 入住日期区间 组合检索。
 -- ---------------------------------------------------------------------
-CREATE VIEW `v_tech_schedule_today` AS
+CREATE VIEW `v_guest_profile` AS
 SELECT
-    ts.schedule_id,
-    ts.work_date,
-    ts.time_slot,
-    t.tech_id,
-    t.tech_name,
-    t.tech_level,
-    t.specialty,
-    ts.is_booked,
-    CASE WHEN ts.is_booked = 1 THEN '已约' ELSE '空闲' END AS slot_label
-FROM tech_schedule ts
-JOIN technician t ON t.tech_id = ts.tech_id;
+    u.user_id,
+    u.username,
+    u.real_name,
+    u.phone,
+    u.email,
+    u.role,
+    u.is_active,
+    ro.order_id,
+    r.room_number,
+    rt.type_name,
+    rt.price,
+    ro.check_in_date,
+    ro.check_out_date,
+    ro.nights,
+    ro.total_price,
+    ro.guest_name,
+    ro.guest_phone,
+    ro.id_card,
+    ro.group_id,
+    gg.group_name,
+    ro.settlement_no,
+    ro.status              AS raw_status,
+    o.status_label,
+    o.status_category
+FROM `user` u
+LEFT JOIN room_order ro ON ro.user_id = u.user_id
+LEFT JOIN v_all_orders o ON o.order_type = 'room' AND o.order_id = ro.order_id
+LEFT JOIN room r ON r.room_id = ro.room_id
+LEFT JOIN room_type rt ON rt.type_id = r.type_id
+LEFT JOIN guest_group gg ON gg.group_id = ro.group_id;
+
+
+-- ---------------------------------------------------------------------
+--  V7. 结账单明细视图（题目要求 (1)(5)：结账单与结账报表）
+--
+--  一张结账单 → 多张客房订单 → 各自的收款流水，全部展开成明细行，
+--  供"查看结账单明细""导出结账报表"直接读取：
+--    · 团体结账：settlement.group_id 非空，一个账单号覆盖多间房；
+--    · 散客结账：settlement.group_id 为空，一个账单号一间房。
+-- ---------------------------------------------------------------------
+CREATE VIEW `v_settlement_detail` AS
+SELECT
+    s.settlement_no,
+    s.group_id,
+    gg.group_name,
+    s.user_id,
+    u.username,
+    s.room_count,
+    s.total_amount,
+    s.method,
+    CASE s.method
+        WHEN 'cash'        THEN '现金'
+        WHEN 'card'        THEN '银行卡'
+        WHEN 'wechat'      THEN '微信'
+        WHEN 'alipay'      THEN '支付宝'
+        WHEN 'room_charge' THEN '挂房账'
+    END                    AS method_label,
+    s.operator_id,
+    op.username            AS operator_name,
+    s.status               AS settlement_status,
+    s.status = 'settled'   AS is_settled,
+    s.settled_at,
+    s.remark,
+    ro.order_id,
+    ro.guest_name,
+    ro.id_card,
+    r.room_number,
+    rt.type_name,
+    ro.check_in_date,
+    ro.check_out_date,
+    ro.nights,
+    ro.total_price,
+    p.payment_no,
+    p.amount               AS paid_amount,
+    p.status               AS payment_status,
+    p.paid_at
+FROM settlement s
+JOIN `user` u ON u.user_id = s.user_id
+LEFT JOIN `user` op ON op.user_id = s.operator_id
+LEFT JOIN guest_group gg ON gg.group_id = s.group_id
+LEFT JOIN room_order ro ON ro.settlement_no = s.settlement_no
+LEFT JOIN room r ON r.room_id = ro.room_id
+LEFT JOIN room_type rt ON rt.type_id = r.type_id
+LEFT JOIN payment p
+       ON p.order_type = 'room' AND p.order_id = ro.order_id AND p.status = 'paid';
+
+

@@ -2,32 +2,34 @@
 管理端各标签页。
 
 重点修正：
-  · 「禁用/启用」按钮原先实际执行 DELETE FROM user，且外键是 CASCADE，
+  · 「禁用/启用」按钮原先实际把用户记录物理删除，且外键是 CASCADE，
     会连带删掉该用户全部订单。现在改为 is_active 软禁用，历史订单完整保留；
   · 「收入」原先按订单状态求和（未收款的订单也计入），现在只统计
     payment 表的真实流水，并支持日期区间筛选；
   · 资源管理原先直接拼表名与列名做增删改，且列顺序一变就错位。
-    现在按显式声明的字段规格操作，并明确禁止修改主键。
+    现在按显式声明的字段规格操作，并明确禁止修改主键，且对
+    房型/房间的改动强制走「密码支持 + 变更留痕」（题目要求 (4)）；
+  · 新增「结账报表」页：汇总结账单、支持按时间范围筛选、导出 CSV
+    与整单退款（题目要求 (5)）。
 """
 
 from __future__ import annotations
 
+import csv
 import tkinter as tk
 from datetime import date, timedelta
-from tkinter import ttk
+from tkinter import filedialog, ttk
 
 from app import service, stats
 from app.service import BusinessError
 from app.ui.widgets import (
-    CS, FONT, DataTable, DateField, DetailDialog, LabeledCombo, LabeledEntry,
+    CS, FONT, DataTable, DetailDialog, LabeledCombo, LabeledEntry,
     RoundedButton, StatCard, info, warn,
 )
 
-# =====================================================================
-#  资源管理
-#  字段规格由 service.RESOURCE_CATALOG 提供（白名单），
-#  界面只负责渲染，增删改一律走 service.resource_* 系列函数。
-# =====================================================================
+#: 支付流水状态 -> 中文（结账单明细的「支付状态」列）
+PAYMENT_STATUS_LABEL = {"paid": "已支付", "refunded": "已退款",
+                        "pending": "待支付", "failed": "支付失败"}
 
 
 def _fmt_time(value) -> str:
@@ -39,6 +41,18 @@ def _fmt_money(value) -> str:
         return f"¥{float(value or 0):,.2f}"
     except (TypeError, ValueError):
         return "¥0.00"
+
+
+def _fmt_payment_status(status) -> str:
+    return PAYMENT_STATUS_LABEL.get(status, status or "未支付")
+
+
+def _fmt_audit_value(value) -> str:
+    """审计留痕里的旧值/新值可能很长，列表里截断显示。"""
+    if value is None:
+        return "—"
+    text = str(value)
+    return text if len(text) <= 60 else text[:57] + "..."
 
 
 class AdminTab(tk.Frame):
@@ -62,7 +76,7 @@ class RevenueTab(AdminTab):
     营收与统计。
 
     收入只来自 payment 表的真实流水（paid 状态），
-    可按起止日期筛选，并展示支付方式与每日趋势。
+    可按起止日期筛选，并展示支付方式与每日营收流水。
     """
 
     def __init__(self, parent, window):
@@ -101,49 +115,28 @@ class RevenueTab(AdminTab):
         body = tk.Frame(self, bg=CS.BG_MAIN)
         body.pack(fill="both", expand=True, padx=14, pady=(0, 12))
 
-        # 左：按业务线
+        # 左：支付方式分布
         left = tk.Frame(body, bg=CS.BG_MAIN)
         left.pack(side="left", fill="both", expand=True, padx=(0, 6))
-        tk.Label(left, text="按业务线（实收）", font=(FONT, 11, "bold"), bg=CS.BG_MAIN,
+        tk.Label(left, text="支付方式分布", font=(FONT, 11, "bold"), bg=CS.BG_MAIN,
                  fg=CS.TEXT_PRIMARY).pack(anchor="w", pady=(0, 4))
-        self.type_table = DataTable(left, [
-            ("type_label", "业务", 80),
-            ("payment_count", "笔数", 60),
-            ("amount", "金额", 110),
-        ], height=6)
-        self.type_table.pack(fill="both", expand=True)
-
-        tk.Label(left, text="订单量 / 状态分布", font=(FONT, 11, "bold"), bg=CS.BG_MAIN,
-                 fg=CS.TEXT_PRIMARY).pack(anchor="w", pady=(8, 4))
-        self.service_table = DataTable(left, [
-            ("type_label", "业务", 80),
-            ("order_count", "总量", 60),
-            ("active_count", "进行中", 70),
-            ("completed_count", "已完成", 70),
-            ("cancelled_count", "已取消", 70),
-            ("order_amount", "订单金额", 110),
-        ], height=7)
-        self.service_table.pack(fill="both", expand=True)
-
-        # 右：支付方式 + 每日趋势
-        right = tk.Frame(body, bg=CS.BG_MAIN)
-        right.pack(side="left", fill="both", expand=True, padx=(6, 0))
-        tk.Label(right, text="支付方式分布", font=(FONT, 11, "bold"), bg=CS.BG_MAIN,
-                 fg=CS.TEXT_PRIMARY).pack(anchor="w", pady=(0, 4))
-        self.method_table = DataTable(right, [
+        self.method_table = DataTable(left, [
             ("method_label", "方式", 90),
             ("payment_count", "笔数", 60),
             ("amount", "金额", 110),
-        ], height=5)
-        self.method_table.pack(fill="x")
+        ], height=12)
+        self.method_table.pack(fill="both", expand=True)
 
+        # 右：每日营收流水
+        right = tk.Frame(body, bg=CS.BG_MAIN)
+        right.pack(side="left", fill="both", expand=True, padx=(6, 0))
         tk.Label(right, text="每日营收", font=(FONT, 11, "bold"), bg=CS.BG_MAIN,
-                 fg=CS.TEXT_PRIMARY).pack(anchor="w", pady=(8, 4))
+                 fg=CS.TEXT_PRIMARY).pack(anchor="w", pady=(0, 4))
         self.day_table = DataTable(right, [
             ("pay_date", "日期", 110),
             ("payment_count", "笔数", 60),
             ("amount", "金额", 110),
-        ], height=8)
+        ], height=14)
         self.day_table.pack(fill="both", expand=True)
 
         self.on_show()
@@ -171,23 +164,16 @@ class RevenueTab(AdminTab):
             self.cards["refunded"].update_value(_fmt_money(revenue["refunded"]))
             self.cards["net"].update_value(_fmt_money(revenue["net"]))
             self.cards["payment_count"].update_value(str(
-                sum(int(r["payment_count"]) for r in revenue["by_type"])))
+                sum(int(r["payment_count"]) for r in revenue["by_method"])))
             self.cards["pending_payment"].update_value(str(overview["pending_payment"]))
 
             orders = service.list_orders(self.db, limit=None)
             self.cards["orders"].update_value(str(len(orders)))
 
-            self.type_table.set_rows(revenue["by_type"], formatter=lambda r: (
-                r["type_label"], r["payment_count"], _fmt_money(r["amount"])))
             self.method_table.set_rows(revenue["by_method"], formatter=lambda r: (
                 r["method_label"], r["payment_count"], _fmt_money(r["amount"])))
             self.day_table.set_rows(revenue["by_day"], formatter=lambda r: (
                 str(r["pay_date"]), r["payment_count"], _fmt_money(r["amount"])))
-            self.service_table.set_rows(stats.service_stats(self.db),
-                                        formatter=lambda s: (
-                s["type_label"], s["order_count"], s["active_count"],
-                s["completed_count"], s["cancelled_count"],
-                _fmt_money(s["order_amount"])))
 
             label = self.range_combo.get()
             self.app.status.show(
@@ -195,6 +181,351 @@ class RevenueTab(AdminTab):
                 f"净收入 {_fmt_money(revenue['net'])}", "success")
 
         self.app.run_guarded(action)
+
+
+# =====================================================================
+#  结账报表（题目要求 (5)）
+# =====================================================================
+class SettlementReportTab(AdminTab):
+    """
+    结账报表。
+
+    与「数据统计」页的分工：
+      · 数据统计看的是收款流水（payment）——「收了多少钱」；
+      · 本页看的是结账单（settlement）——「结了多少单、多少间房、怎么结的」。
+
+    数据全部来自业务层：
+      stats.settlement_report 负责汇总，service.list_settlements /
+      settlement_detail 负责明细，refund_settlement 负责整单退款。
+    界面层不出现任何 SQL。
+    """
+
+    def __init__(self, parent, window):
+        super().__init__(parent, window)
+        self._rows: list[dict] = []          # 当前筛选出的结账单，供导出 CSV 使用
+
+        header = tk.Frame(self, bg=CS.BG_MAIN)
+        header.pack(fill="x", padx=14, pady=(12, 6))
+        tk.Label(header, text="🧾 结账报表", font=(FONT, 14, "bold"),
+                 bg=CS.BG_MAIN, fg=CS.TEXT_PRIMARY).pack(side="left")
+
+        self.range_combo = ttk.Combobox(
+            header, values=["今日", "近 7 天", "近 30 天", "本月", "全部"],
+            font=(FONT, 10), width=10, state="readonly")
+        self.range_combo.current(4)
+        self.range_combo.pack(side="left", padx=12)
+        self.range_combo.bind("<<ComboboxSelected>>", lambda _e: self.on_show())
+
+        RoundedButton(header, text="🔄 刷新", width=90, height=30, radius=6,
+                      font=(FONT, 9, "bold"), command=self.on_show).pack(side="right")
+        RoundedButton(header, text="📤 导出 CSV", width=110, height=30, radius=6,
+                      font=(FONT, 9, "bold"), color=CS.TEAL,
+                      hover_color=CS.TEAL_DARK,
+                      command=self.export_csv).pack(side="right", padx=6)
+        RoundedButton(header, text="↩ 整单退款", width=110, height=30, radius=6,
+                      font=(FONT, 9, "bold"), color=CS.DANGER,
+                      hover_color=CS.DANGER_DARK,
+                      command=self.refund).pack(side="right", padx=6)
+
+        # --- 统计卡片：结账单数 / 房间数 / 金额 / 散客 / 团体 / 均单 / 退款 / 未结账
+        cards = tk.Frame(self, bg=CS.BG_MAIN)
+        cards.pack(fill="x", padx=14, pady=(4, 6))
+        self.cards: dict[str, StatCard] = {}
+        for index, (key, label, color) in enumerate((
+            ("bill_count", "结账单数", CS.PRIMARY),
+            ("room_count", "结账房间数", CS.TEAL),
+            ("total_amount", "结账金额", CS.SUCCESS),
+            ("avg_bill", "平均单额", CS.BG_DARK),
+            ("walkin_count", "散客单数", CS.PURPLE),
+            ("group_count", "团体单数", CS.WARNING),
+            ("refunded_count", "已退款单数", CS.DANGER),
+            ("unsettled_orders", "未结账订单", CS.NEUTRAL),
+        )):
+            card = StatCard(cards, label, "-", color, width=210, height=72)
+            card.grid(row=index // 4, column=index % 4, padx=6, pady=4)
+            self.cards[key] = card
+
+        # --- 结账单列表
+        list_host = tk.Frame(self, bg=CS.BG_MAIN)
+        list_host.pack(fill="both", expand=True, padx=14)
+        tk.Label(list_host, text="结账单列表（选中一行即可查看该账单的房间明细）",
+                 font=(FONT, 11, "bold"), bg=CS.BG_MAIN,
+                 fg=CS.TEXT_PRIMARY).pack(anchor="w", pady=(0, 4))
+        self.table = DataTable(list_host, [
+            ("settlement_no", "结账单号", 170),
+            ("bill_type", "类型", 60),
+            ("group_name", "团体名", 100),
+            ("username", "付款人", 85),
+            ("room_count", "房间数", 60),
+            ("total_amount", "金额", 95),
+            ("method_label", "结算方式", 80),
+            ("operator_name", "经手人", 85),
+            ("status_label", "状态", 75),
+            ("settled_at", "结账时间", 135),
+            ("remark", "备注", 130),
+        ], height=6, on_select=lambda _row: self.load_detail(),
+            on_double_click=lambda _row: self.load_detail())
+        self.table.pack(fill="both", expand=True)
+
+        # --- 结账单明细（选中账单后填充）
+        detail_host = tk.Frame(self, bg=CS.BG_MAIN)
+        detail_host.pack(fill="x", padx=14, pady=(8, 0))
+        self.detail_label = tk.Label(detail_host, text="结账单明细（请先选择账单）",
+                                     font=(FONT, 11, "bold"), bg=CS.BG_MAIN,
+                                     fg=CS.TEXT_PRIMARY)
+        self.detail_label.pack(anchor="w", pady=(0, 4))
+        self.detail_table = DataTable(detail_host, [
+            ("room_number", "房间号", 80),
+            ("type_name", "房型", 100),
+            ("guest_name", "入住人", 90),
+            ("id_card", "证件号", 150),
+            ("check_in_date", "入住", 95),
+            ("check_out_date", "离店", 95),
+            ("nights", "晚数", 55),
+            ("total_price", "订单金额", 90),
+            ("payment_no", "支付流水号", 165),
+            ("payment_status", "支付状态", 85),
+        ], height=4)
+        self.detail_table.pack(fill="both", expand=True)
+
+        # --- 下方两个分组小表：按结算方式分布 / 按日结账流水
+        bottom = tk.Frame(self, bg=CS.BG_MAIN)
+        bottom.pack(fill="both", expand=True, padx=14, pady=(8, 12))
+
+        left = tk.Frame(bottom, bg=CS.BG_MAIN)
+        left.pack(side="left", fill="both", expand=True, padx=(0, 6))
+        tk.Label(left, text="按结算方式分布", font=(FONT, 11, "bold"), bg=CS.BG_MAIN,
+                 fg=CS.TEXT_PRIMARY).pack(anchor="w", pady=(0, 4))
+        self.method_table = DataTable(left, [
+            ("method_label", "结算方式", 90),
+            ("bill_count", "结账单数", 80),
+            ("amount", "金额", 120),
+        ], height=4)
+        self.method_table.pack(fill="both", expand=True)
+
+        right = tk.Frame(bottom, bg=CS.BG_MAIN)
+        right.pack(side="left", fill="both", expand=True, padx=(6, 0))
+        tk.Label(right, text="按日结账流水", font=(FONT, 11, "bold"), bg=CS.BG_MAIN,
+                 fg=CS.TEXT_PRIMARY).pack(anchor="w", pady=(0, 4))
+        self.day_table = DataTable(right, [
+            ("settle_date", "日期", 110),
+            ("bill_count", "结账单数", 80),
+            ("room_count", "房间数", 70),
+            ("amount", "金额", 120),
+        ], height=4)
+        self.day_table.pack(fill="both", expand=True)
+
+        self.on_show()
+
+    def _range(self) -> tuple[date | None, date | None]:
+        """把时间范围下拉框转成起止日期（与「数据统计」页保持一致）。"""
+        choice = self.range_combo.get()
+        today = date.today()
+        if choice == "今日":
+            return today, today
+        if choice == "近 7 天":
+            return today - timedelta(days=6), today
+        if choice == "近 30 天":
+            return today - timedelta(days=29), today
+        if choice == "本月":
+            return today.replace(day=1), today
+        return None, None
+
+    def on_show(self) -> None:
+        def action() -> None:
+            start, end = self._range()
+            report = stats.settlement_report(self.db, start, end)
+
+            self.cards["bill_count"].update_value(str(report["bill_count"]))
+            self.cards["room_count"].update_value(str(report["room_count"]))
+            self.cards["total_amount"].update_value(_fmt_money(report["total_amount"]))
+            self.cards["avg_bill"].update_value(_fmt_money(report["avg_bill"]))
+            self.cards["walkin_count"].update_value(str(report["walkin_count"]))
+            self.cards["group_count"].update_value(str(report["group_count"]))
+            self.cards["refunded_count"].update_value(str(report["refunded_count"]))
+            self.cards["unsettled_orders"].update_value(
+                str(report["unsettled_orders"]))
+
+            self._rows = service.list_settlements(self.db, start=start, end=end)
+            self.table.set_rows(self._rows, formatter=lambda s: (
+                s["settlement_no"], s["bill_type"], s.get("group_name") or "—",
+                s["username"], s["room_count"], _fmt_money(s["total_amount"]),
+                s.get("method_label") or "—", s.get("operator_name") or "—",
+                s.get("status_label") or s["status"], _fmt_time(s["settled_at"]),
+                s.get("remark") or "—",
+            ))
+
+            # 列表重填后选中项会丢失，明细同步清空，避免显示上一张账单
+            self.detail_table.clear()
+            self.detail_label.config(text="结账单明细（请先选择账单）")
+
+            self.method_table.set_rows(report["by_method"], formatter=lambda r: (
+                r.get("method_label") or "—", r["bill_count"], _fmt_money(r["amount"])))
+            self.day_table.set_rows(report["by_day"], formatter=lambda r: (
+                str(r["settle_date"]), r["bill_count"], r["room_count"],
+                _fmt_money(r["amount"])))
+
+            self.app.status.show(
+                f"{self.range_combo.get()}：{report['bill_count']} 张结账单 / "
+                f"{report['room_count']} 间房 / 金额 {_fmt_money(report['total_amount'])}，"
+                f"已退款 {report['refunded_count']} 张", "success")
+
+        self.app.run_guarded(action)
+
+    def load_detail(self) -> None:
+        """加载选中结账单的房间明细（v_settlement_detail）。"""
+        row = self.table.selected()
+        if row is None:
+            return
+
+        def action() -> None:
+            details = service.settlement_detail(self.db, row["settlement_no"])
+            self.detail_label.config(
+                text=f"结账单明细：{row['settlement_no']}"
+                     f"（{row['bill_type']}・{row['username']}・"
+                     f"{row['room_count']} 间房・{len(details)} 条明细）")
+            self.detail_table.set_rows(details, formatter=lambda d: (
+                d.get("room_number") or "—", d.get("type_name") or "—",
+                d.get("guest_name") or "—", d.get("id_card") or "—",
+                str(d.get("check_in_date") or "—"),
+                str(d.get("check_out_date") or "—"),
+                d.get("nights") or 0, _fmt_money(d.get("total_price")),
+                d.get("payment_no") or "—",
+                _fmt_payment_status(d.get("payment_status")),
+            ))
+            self.app.status.show(
+                f"结账单 {row['settlement_no']}：{len(details)} 条房间明细", "info")
+
+        self.app.run_guarded(action)
+
+    def export_csv(self) -> None:
+        """
+        导出当前结账单列表为 CSV。
+
+        用标准库 csv + tkinter.filedialog，编码固定 utf-8-sig（带 BOM），
+        Excel 双击即可正确显示中文，不引入任何新依赖。
+        """
+        if not self._rows:
+            warn("提示", "当前时间范围内没有结账单可导出，请调整范围后刷新。",
+                 parent=self.app.window)
+            return
+
+        path = filedialog.asksaveasfilename(
+            parent=self.app.window, title="导出结账报表（结账单列表）",
+            defaultextension=".csv", initialfile=f"结账报表_{date.today():%Y%m%d}.csv",
+            filetypes=[("CSV 文件", "*.csv"), ("所有文件", "*.*")])
+        if not path:
+            return
+
+        rows = list(self._rows)
+        scope = self.range_combo.get()
+
+        def action() -> None:
+            with open(path, "w", newline="", encoding="utf-8-sig") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(["结账单号", "类型", "团体名", "付款人", "房间数",
+                                 "金额", "结算方式", "经手人", "状态", "结账时间",
+                                 "备注"])
+                for row in rows:
+                    writer.writerow([
+                        row["settlement_no"], row["bill_type"],
+                        row.get("group_name") or "", row["username"],
+                        row["room_count"],
+                        f"{float(row['total_amount'] or 0):.2f}",
+                        row.get("method_label") or "",
+                        row.get("operator_name") or "",
+                        row.get("status_label") or row["status"],
+                        _fmt_time(row["settled_at"]), row.get("remark") or "",
+                    ])
+            info("导出成功",
+                 f"导出内容：结账单列表（不含房间明细）\n"
+                 f"时间范围：{scope}　共 {len(rows)} 张结账单\n"
+                 f"编码：utf-8-sig（Excel 可直接打开）\n\n"
+                 f"文件路径：\n{path}", parent=self.app.window)
+
+        self.app.run_guarded(action)
+
+    def refund(self) -> None:
+        """对选中的结账单办理整单退款（二次确认 + 记录退款原因）。"""
+        row = self.table.selected()
+        if row is None:
+            warn("提示", "请先选择一张结账单", parent=self.app.window)
+            return
+        if row["status"] != "settled":
+            warn("提示", f"结账单 {row['settlement_no']} 当前是"
+                         f"「{row['status_label']}」，无需重复退款。",
+                 parent=self.app.window)
+            return
+
+        reason = self._ask_reason(
+            "整单退款",
+            f"结账单：{row['settlement_no']}\n付款人：{row['username']}　"
+            f"金额：{_fmt_money(row['total_amount'])}　房间数：{row['room_count']}")
+        if reason is None:
+            return
+
+        settlement_no = row["settlement_no"]
+
+        def action() -> None:
+            result = service.refund_settlement(
+                self.db, settlement_no=settlement_no,
+                operator_id=self.session.user_id, reason=reason)
+            info("已退款",
+                 f"结账单 {result['settlement_no']} 已整单退款。\n"
+                 f"涉及房间订单 {result['order_count']} 张，"
+                 f"置为退款的收款流水 {result['refunded_payments']} 笔，\n"
+                 f"退款金额：{_fmt_money(result['refund_amount'])}\n\n"
+                 f"成员订单已回到「未结账」状态，如需作废请再执行取消订单。",
+                 parent=self.app.window)
+            self.on_show()
+
+        self.app.run_guarded(
+            action, confirm_title="确认整单退款",
+            confirm_text=f"确定要为结账单 {settlement_no} 办理整单退款吗？\n\n"
+                         f"付款人：{row['username']}\n"
+                         f"金额：{_fmt_money(row['total_amount'])}\n"
+                         f"退款原因：{reason or '（未填写）'}\n\n"
+                         f"退款后收款流水置为已退款，成员订单回到未结账状态。")
+
+    def _ask_reason(self, title: str, detail: str) -> str | None:
+        """弹出「退款原因」对话框；用户取消时返回 None。"""
+        dialog = tk.Toplevel(self.app.window)
+        dialog.title(title)
+        dialog.configure(bg=CS.BG_WHITE)
+        dialog.resizable(False, False)
+        dialog.transient(self.app.window)
+        dialog.grab_set()
+
+        tk.Label(dialog, text="↩ 整单退款", font=(FONT, 14, "bold"),
+                 bg=CS.BG_WHITE, fg=CS.TEXT_PRIMARY).pack(pady=(18, 8))
+        tk.Label(dialog, text=detail, font=(FONT, 9), bg=CS.BG_WHITE,
+                 fg=CS.TEXT_SECONDARY, justify="left", wraplength=330).pack(padx=26)
+
+        form = tk.Frame(dialog, bg=CS.BG_WHITE)
+        form.pack(padx=30, fill="x", pady=(8, 0))
+        reason = LabeledEntry(form, "退款原因（选填）", width=28)
+        reason.pack(fill="x")
+
+        holder: dict[str, str | None] = {"value": None}
+
+        def submit() -> None:
+            holder["value"] = reason.get()
+            dialog.destroy()
+
+        buttons = tk.Frame(dialog, bg=CS.BG_WHITE)
+        buttons.pack(pady=14)
+        RoundedButton(buttons, text="确认退款", width=120, height=36, radius=8,
+                      color=CS.DANGER, hover_color=CS.DANGER_DARK,
+                      command=submit).pack(side="left", padx=4)
+        RoundedButton(buttons, text="取消", width=80, height=36, radius=8,
+                      color=CS.NEUTRAL, hover_color=CS.NEUTRAL_DARK,
+                      command=dialog.destroy).pack(side="left", padx=4)
+
+        from app.ui.widgets import center_window
+        center_window(dialog, 390, 300)
+        reason.entry.focus_set()
+        self.app.window.wait_window(dialog)
+        return holder["value"]
 
 
 # =====================================================================
@@ -412,8 +743,78 @@ class UsersTab(AdminTab):
 # =====================================================================
 #  资源管理
 # =====================================================================
+#: 需要「密码支持」的资源表，与 service.AUDITED_TABLES 一致：
+#: 房价在 room_type、房间类型在 room_type、增加客房在 room —— 即题目要求 (4)。
+APPROVAL_TABLES = ("room_type", "room")
+
+
+class ApprovalDialog(tk.Toplevel):
+    """
+    敏感操作的密码支持对话框（题目要求 (4)）。
+
+    题目原文要求「操作员在密码支持下才可更改房价，房间类型，增加客房」。
+    因此对房型 / 房间的任何增删改，都要先在这里重新输入当前账号密码并填写
+    变更原因；密码是否正确由业务层（service.Approval + 哈希校验）判定，
+    界面只负责收集，既不预判也不吞掉 BusinessError。
+    """
+
+    def __init__(self, parent, *, action_label: str, target_label: str,
+                 operator_name: str):
+        super().__init__(parent)
+        self.title("密码支持与变更留痕")
+        self.configure(bg=CS.BG_WHITE)
+        self.resizable(False, False)
+        self.transient(parent)
+        self.grab_set()
+
+        #: (密码, 变更原因)；用户取消时保持 None
+        self.result: tuple[str, str] | None = None
+
+        tk.Label(self, text="🔐 密码支持", font=(FONT, 14, "bold"),
+                 bg=CS.BG_WHITE, fg=CS.TEXT_PRIMARY).pack(pady=(18, 6))
+        tk.Label(self, text=f"{action_label}「{target_label}」属于房价 / 房型 / 房间的"
+                            f"敏感改动，需要操作员密码支持，并会记录变更原因。",
+                 font=(FONT, 9), bg=CS.BG_WHITE, fg=CS.TEXT_SECONDARY,
+                 justify="left", wraplength=320).pack(padx=28)
+
+        form = tk.Frame(self, bg=CS.BG_WHITE)
+        form.pack(padx=30, pady=(10, 0), fill="x")
+        tk.Label(form, text=f"操作员：{operator_name}", font=(FONT, 10),
+                 bg=CS.BG_WHITE, fg=CS.TEXT_PRIMARY).pack(anchor="w")
+        self.password = LabeledEntry(form, "当前账号密码", width=26, show="●")
+        self.password.pack(fill="x", pady=(6, 0))
+        self.reason = LabeledEntry(form, "变更原因（建议填写）", width=26)
+        self.reason.pack(fill="x")
+
+        self._error = tk.StringVar()
+        tk.Label(self, textvariable=self._error, font=(FONT, 9), bg=CS.BG_WHITE,
+                 fg=CS.DANGER, wraplength=320, justify="left").pack(pady=(4, 0))
+
+        buttons = tk.Frame(self, bg=CS.BG_WHITE)
+        buttons.pack(pady=14)
+        RoundedButton(buttons, text="确认", width=110, height=36, radius=8,
+                      color=CS.SUCCESS, hover_color=CS.SUCCESS_DARK,
+                      command=self._submit).pack(side="left", padx=4)
+        RoundedButton(buttons, text="取消", width=80, height=36, radius=8,
+                      color=CS.NEUTRAL, hover_color=CS.NEUTRAL_DARK,
+                      command=self.destroy).pack(side="left", padx=4)
+
+        from app.ui.widgets import center_window
+        center_window(self, 380, 350)
+        self.password.entry.focus_set()
+
+    def _submit(self) -> None:
+        password = self.password.get()
+        if not password:
+            # 密码为空不提交，留在对话框里提示
+            self._error.set("⚠ 密码为空，操作未提交。请输入当前账号密码。")
+            return
+        self.result = (password, self.reason.get())
+        self.destroy()
+
+
 class ResourcesTab(AdminTab):
-    """基础资源（房型/房间/餐厅/菜品/设施/SPA/技师）维护。"""
+    """基础资源（房型/房间）维护。"""
 
     def __init__(self, parent, window):
         super().__init__(parent, window)
@@ -422,7 +823,8 @@ class ResourcesTab(AdminTab):
         header.pack(fill="x", padx=14, pady=(12, 6))
         tk.Label(header, text="🔧 基础资源管理", font=(FONT, 14, "bold"), bg=CS.BG_MAIN,
                  fg=CS.TEXT_PRIMARY).pack(side="left")
-        tk.Label(header, text="（选择左侧资源类型 → 右侧增删改；主键不可修改）",
+        tk.Label(header, text="（选择左侧资源类型 → 右侧增删改；房价/房型/房间的改动"
+                              "需输入密码并自动留痕，主键不可修改）",
                  font=(FONT, 9), bg=CS.BG_MAIN, fg=CS.TEXT_SECONDARY).pack(side="left",
                                                                             padx=8)
 
@@ -471,6 +873,10 @@ class ResourcesTab(AdminTab):
                       font=(FONT, 9, "bold"), color=CS.DANGER,
                       hover_color=CS.DANGER_DARK,
                       command=self.delete).pack(side="right", padx=4)
+        RoundedButton(toolbar, text="📜 变更记录", width=110, height=30, radius=6,
+                      font=(FONT, 9, "bold"), color=CS.PURPLE,
+                      hover_color=CS.PURPLE_DARK,
+                      command=self.show_logs).pack(side="right", padx=4)
         RoundedButton(toolbar, text="🔄 刷新", width=90, height=30, radius=6,
                       font=(FONT, 9, "bold"),
                       command=self.on_show).pack(side="right", padx=4)
@@ -534,23 +940,38 @@ class ResourcesTab(AdminTab):
             entry.pack(fill="x")
             entries[field["name"]] = entry
 
-        error_var = tk.StringVar()
-        tk.Label(dialog, textvariable=error_var, font=(FONT, 9), bg=CS.BG_WHITE,
-                 fg=CS.DANGER, wraplength=320, justify="left").pack(pady=(8, 0))
+        needs_approval = table_name in APPROVAL_TABLES
+        if needs_approval:
+            tk.Label(dialog, text="⚠ 该资源属于「房价 / 房型 / 房间」，保存时需要输入"
+                                  "当前账号密码（题目要求的密码支持）。",
+                     font=(FONT, 9), bg=CS.BG_WHITE, fg=CS.TEXT_SECONDARY,
+                     wraplength=320, justify="left").pack(padx=24, pady=(8, 0))
 
         def submit() -> None:
             values = {col: entry.get() for col, entry in entries.items()}
-            try:
+            action_label = "新增" if row is None else "修改"
+
+            # 房价 / 房型 / 房间：必须先拿到密码凭据，密码为空不提交
+            approval = None
+            if needs_approval:
+                approval = self._ask_approval(action_label=action_label,
+                                              target_label=name)
+                if approval is None:
+                    return
+
+            def action() -> None:
                 if row is None:
-                    service.resource_create(self.db, table_name, values)
+                    service.resource_create(self.db, table_name, values,
+                                            approval=approval)
                 else:
-                    service.resource_update(self.db, table_name, row[pk], values)
-            except BusinessError as exc:
-                error_var.set(f"⚠ {exc}")
-                return
-            info("保存成功", f"{name}数据已保存。", parent=dialog)
-            dialog.destroy()
-            self.on_show()
+                    service.resource_update(self.db, table_name, row[pk], values,
+                                            approval=approval)
+                info("保存成功", f"{name}数据已保存。", parent=dialog)
+                dialog.destroy()
+                self.on_show()
+
+            # 密码错误会由业务层抛 BusinessError，统一交给 run_guarded 提示
+            self.app.run_guarded(action)
 
         buttons = tk.Frame(dialog, bg=CS.BG_WHITE)
         buttons.pack(pady=14)
@@ -562,7 +983,33 @@ class ResourcesTab(AdminTab):
                       command=dialog.destroy).pack(side="left", padx=4)
 
         from app.ui.widgets import center_window
-        center_window(dialog, 400, 160 + 62 * len(editable))
+        center_window(dialog, 400, 180 + 62 * len(editable))
+
+    def _ask_approval(self, *, action_label: str,
+                      target_label: str) -> service.Approval | None:
+        """
+        弹出密码支持对话框并组装 service.Approval。
+
+        用户取消、或密码为空时返回 None（调用方据此不提交任何请求）。
+        """
+        dialog = ApprovalDialog(self.app.window, action_label=action_label,
+                                target_label=target_label,
+                                operator_name=f"{self.session.real_name}"
+                                              f"（{self.session.username}）")
+        self.app.window.wait_window(dialog)
+
+        if dialog.result is None:
+            self.app.status.show(f"{action_label}已取消：未输入密码", "warn")
+            return None
+
+        password, reason = dialog.result
+        if not password.strip():
+            warn("提示", "密码为空，操作未提交。", parent=self.app.window)
+            return None
+
+        return service.Approval(operator_id=self.session.user_id,
+                                operator_name=self.session.username,
+                                password=password, reason=reason)
 
     def add(self) -> None:
         self._open_editor(None)
@@ -586,8 +1033,15 @@ class ResourcesTab(AdminTab):
         name_field = next((f["name"] for f in spec["fields"][1:]), pk)
         label = str(row.get(name_field, row.get(pk)))
 
+        # 删除同样属于敏感改动：先取密码凭据，再走二次确认
+        approval = None
+        if table_name in APPROVAL_TABLES:
+            approval = self._ask_approval(action_label="删除", target_label=label)
+            if approval is None:
+                return
+
         def action() -> None:
-            service.resource_delete(self.db, table_name, row[pk])
+            service.resource_delete(self.db, table_name, row[pk], approval=approval)
             info("已删除", f"{name}「{label}」已删除。", parent=self.app.window)
             self.on_show()
 
@@ -595,6 +1049,70 @@ class ResourcesTab(AdminTab):
             action, confirm_title="确认删除",
             confirm_text=f"确定要删除{name}「{label}」吗？\n\n"
                          f"若该记录被房间/订单等数据引用，数据库会拒绝删除。")
+
+    def show_logs(self) -> None:
+        """
+        变更记录：展示当前资源类型的 price_change_log 留痕。
+
+        每次改动房价 / 房型 / 房间都会记录「旧值 → 新值」、原因与操作人，
+        用于回答题目要求 (4) 的「密码支持下才可改动 + 留痕」。
+        """
+        spec = self._current_spec()
+        table_name, name = spec["table"], spec["label"]
+
+        dialog = tk.Toplevel(self.app.window)
+        dialog.title(f"{name}变更记录")
+        dialog.configure(bg=CS.BG_WHITE)
+        dialog.transient(self.app.window)
+        dialog.grab_set()
+
+        tk.Label(dialog, text=f"📜 {name}变更记录（最近 100 条）",
+                 font=(FONT, 13, "bold"), bg=CS.BG_WHITE,
+                 fg=CS.TEXT_PRIMARY).pack(pady=(16, 6))
+        tk.Label(dialog, text="对房价 / 房型 / 房间的每次增删改都会留下记录："
+                              "对象、字段、旧值、新值、原因与操作人。",
+                 font=(FONT, 9), bg=CS.BG_WHITE, fg=CS.TEXT_SECONDARY,
+                 wraplength=820).pack(padx=16)
+
+        table = DataTable(dialog, [
+            ("changed_at", "时间", 140),
+            ("table_label", "资源", 70),
+            ("target_label", "对象", 110),
+            ("field_label", "字段", 90),
+            ("old_value", "旧值", 130),
+            ("new_value", "新值", 130),
+            ("reason", "原因", 150),
+            ("operator_name", "操作人", 90),
+        ], height=14)
+        table.pack(fill="both", expand=True, padx=16, pady=(8, 0))
+
+        def load() -> None:
+            logs = service.list_price_change_logs(self.db, limit=100,
+                                                  table=table_name)
+            table.set_rows(logs, formatter=lambda item: (
+                _fmt_time(item.get("changed_at")),
+                item.get("table_label") or "—",
+                item.get("target_label") or "—",
+                item.get("field_label") or item.get("field_name") or "—",
+                _fmt_audit_value(item.get("old_value")),
+                _fmt_audit_value(item.get("new_value")),
+                item.get("reason") or "—",
+                item.get("operator_name") or "—",
+            ))
+            self.app.status.show(f"{name}：{len(logs)} 条变更记录", "info")
+
+        buttons = tk.Frame(dialog, bg=CS.BG_WHITE)
+        buttons.pack(pady=12)
+        RoundedButton(buttons, text="🔄 刷新", width=100, height=34, radius=8,
+                      command=lambda: self.app.run_guarded(load)).pack(side="left",
+                                                                       padx=4)
+        RoundedButton(buttons, text="关闭", width=90, height=34, radius=8,
+                      color=CS.NEUTRAL, hover_color=CS.NEUTRAL_DARK,
+                      command=dialog.destroy).pack(side="left", padx=4)
+
+        from app.ui.widgets import center_window
+        center_window(dialog, 880, 520)
+        self.app.run_guarded(load)
 
 
 # =====================================================================
@@ -611,7 +1129,7 @@ class AdminOrdersTab(AdminTab):
 
         tk.Label(toolbar, text="类型：", font=(FONT, 10), bg=CS.BG_MAIN).pack(side="left")
         self.type_combo = ttk.Combobox(
-            toolbar, values=["全部", "客房", "餐饮", "健身", "SPA", "洗衣"],
+            toolbar, values=["全部", "客房"],
             font=(FONT, 10), width=8, state="readonly")
         self.type_combo.current(0)
         self.type_combo.pack(side="left", padx=(0, 10))
@@ -648,16 +1166,14 @@ class AdminOrdersTab(AdminTab):
 
     def on_show(self) -> None:
         def action() -> None:
-            type_map = {"全部": None, "客房": "room", "餐饮": "dining",
-                        "健身": "fitness", "SPA": "spa", "洗衣": "laundry"}
+            type_map = {"全部": None, "客房": "room"}
             rows = service.list_orders(self.db, order_type=type_map.get(self.type_combo.get()),
                                        status_category=self.status_combo.get())
             paid = service.paid_order_map(self.db)
 
             for row in rows:
-                row["paid_label"] = ("免支付" if row["order_type"] == "fitness"
-                                     else paid.get((row["order_type"], row["order_id"]),
-                                                   "未支付"))
+                row["paid_label"] = paid.get((row["order_type"], row["order_id"]),
+                                             "未支付")
 
             self.table.set_rows(rows, formatter=lambda o: (
                 o["order_id"], o["username"], o["type_label"], o["detail"],

@@ -36,18 +36,6 @@ def overview(db: Database, day: date | None = None) -> dict:
         "departures": db.query_value(
             "SELECT COUNT(*) FROM room_order "
             "WHERE check_out_date = %s AND status = 'checked_in'", (today,), 0),
-        "dining_today": db.query_value(
-            "SELECT COUNT(*) FROM dining_order "
-            "WHERE dining_date = %s AND status <> 'cancelled'", (today,), 0),
-        "fitness_today": db.query_value(
-            "SELECT COUNT(*) FROM fitness_booking "
-            "WHERE booking_date = %s AND status = 'confirmed'", (today,), 0),
-        "spa_today": db.query_value(
-            "SELECT COUNT(*) FROM spa_booking "
-            "WHERE booking_date = %s AND status IN ('confirmed','in_progress')", (today,), 0),
-        "laundry_active": db.query_value(
-            "SELECT COUNT(*) FROM laundry_order "
-            "WHERE status IN ('pending','picked_up','processing')", 0),
         "rooms_total": db.query_value("SELECT COUNT(*) FROM room", 0),
         "rooms_available": db.query_value(
             "SELECT COUNT(*) FROM room WHERE status = 'available'", 0),
@@ -93,9 +81,7 @@ def revenue_summary(db: Database, start: date | None = None,
 
     by_type = db.query(
         f"SELECT order_type, "
-        f"       CASE order_type WHEN 'room' THEN '客房' WHEN 'dining' THEN '餐饮' "
-        f"            WHEN 'fitness' THEN '健身' WHEN 'spa' THEN 'SPA' "
-        f"            WHEN 'laundry' THEN '洗衣' END AS type_label, "
+        f"       CASE order_type WHEN 'room' THEN '客房' END AS type_label, "
         f"       COUNT(*) AS payment_count, COALESCE(SUM(amount), 0) AS amount "
         f"FROM payment WHERE {condition} GROUP BY order_type ORDER BY amount DESC",
         params,
@@ -154,35 +140,6 @@ def room_usage(db: Database) -> list[dict]:
     )
 
 
-def top_dishes(db: Database, limit: int = 10) -> list[dict]:
-    """菜品销量排行（体现明细表的作用）。"""
-    return db.query(
-        "SELECT d.dish_name, r.restaurant_name, SUM(i.quantity) AS sold, "
-        "       SUM(i.subtotal) AS revenue "
-        "FROM dining_order_item i "
-        "JOIN dish d ON d.dish_id = i.dish_id "
-        "JOIN restaurant r ON r.restaurant_id = d.restaurant_id "
-        "GROUP BY d.dish_id, d.dish_name, r.restaurant_name "
-        "ORDER BY sold DESC LIMIT %s",
-        (int(limit),),
-    )
-
-
-def tech_workload(db: Database) -> list[dict]:
-    """技师工作量统计（让 tech_schedule / spa_booking 的数据有意义）。"""
-    return db.query(
-        "SELECT t.tech_id, t.tech_name, t.tech_level, t.rating, "
-        "       COUNT(b.booking_id) AS total_bookings, "
-        "       SUM(CASE WHEN b.status = 'completed' THEN 1 ELSE 0 END) AS completed, "
-        "       COALESCE(SUM(CASE WHEN b.status <> 'cancelled' THEN b.price ELSE 0 END), 0) "
-        "       AS revenue "
-        "FROM technician t "
-        "LEFT JOIN spa_booking b ON b.tech_id = t.tech_id "
-        "GROUP BY t.tech_id, t.tech_name, t.tech_level, t.rating "
-        "ORDER BY total_bookings DESC"
-    )
-
-
 def schema_objects(db: Database) -> dict:
     """
     统计数据库对象数量（表/视图/触发器/索引/外键）。
@@ -212,3 +169,94 @@ def schema_objects(db: Database) -> dict:
             "WHERE constraint_schema = %s", (name,), 0),
     }
     return counts
+
+
+# =====================================================================
+#  结账报表（题目要求 (5)）
+# =====================================================================
+def settlement_report(db: Database, start: date | None = None,
+                      end: date | None = None) -> dict:
+    """
+    结账报表：以结账单（settlement）为主体做统计。
+
+    与 revenue_summary 的分工：
+      · revenue_summary 看的是"收款流水"（payment），回答"收了多少钱"；
+      · 本报表看的是"结账单"，回答"结了多少单、多少间房、谁经手、怎么结的"。
+    只统计 status='settled' 的账单；已退款账单单独计数，不计入金额。
+    """
+    where = ["s.status = 'settled'"]
+    params: list = []
+    if start:
+        where.append("s.settled_at >= %s")
+        params.append(start)
+    if end:
+        where.append("s.settled_at < DATE_ADD(%s, INTERVAL 1 DAY)")
+        params.append(end)
+    cond = " AND ".join(where)
+    date_cond = " AND ".join([c for c in where if not c.startswith("s.status")]) or "1 = 1"
+
+    head = db.query_one(
+        f"SELECT COUNT(*)                                        AS bill_count, "
+        f"       COALESCE(SUM(s.room_count), 0)                   AS room_count, "
+        f"       COALESCE(SUM(s.total_amount), 0)                 AS total_amount, "
+        f"       COALESCE(SUM(CASE WHEN s.group_id IS NULL THEN 1 ELSE 0 END), 0) "
+        f"                                                        AS walkin_count, "
+        f"       COALESCE(SUM(CASE WHEN s.group_id IS NOT NULL THEN 1 ELSE 0 END), 0) "
+        f"                                                        AS group_count "
+        f"FROM settlement s WHERE {cond}", params) or {}
+
+    refunded = db.query_one(
+        f"SELECT COUNT(*) AS cnt, COALESCE(SUM(s.total_amount), 0) AS amount "
+        f"FROM settlement s WHERE s.status = 'refunded' AND {date_cond}", params) or {}
+
+    by_method = db.query(
+        f"SELECT s.method, "
+        f"       CASE s.method WHEN 'cash' THEN '现金' WHEN 'card' THEN '银行卡' "
+        f"            WHEN 'wechat' THEN '微信' WHEN 'alipay' THEN '支付宝' "
+        f"            WHEN 'room_charge' THEN '挂房账' END AS method_label, "
+        f"       COUNT(*) AS bill_count, COALESCE(SUM(s.total_amount), 0) AS amount "
+        f"FROM settlement s WHERE {cond} GROUP BY s.method ORDER BY amount DESC",
+        params)
+
+    by_day = db.query(
+        f"SELECT DATE(s.settled_at) AS settle_date, COUNT(*) AS bill_count, "
+        f"       COALESCE(SUM(s.room_count), 0) AS room_count, "
+        f"       COALESCE(SUM(s.total_amount), 0) AS amount "
+        f"FROM settlement s WHERE {cond} "
+        f"GROUP BY DATE(s.settled_at) ORDER BY settle_date DESC LIMIT 60", params)
+
+    by_operator = db.query(
+        f"SELECT COALESCE(op.username, '—') AS operator_name, COUNT(*) AS bill_count, "
+        f"       COALESCE(SUM(s.total_amount), 0) AS amount "
+        f"FROM settlement s LEFT JOIN `user` op ON op.user_id = s.operator_id "
+        f"WHERE {cond} GROUP BY s.operator_id, op.username ORDER BY amount DESC",
+        params)
+
+    by_type = db.query(
+        f"SELECT CASE WHEN s.group_id IS NULL THEN '散客' ELSE '团体' END AS bill_type, "
+        f"       COUNT(*) AS bill_count, COALESCE(SUM(s.room_count), 0) AS room_count, "
+        f"       COALESCE(SUM(s.total_amount), 0) AS amount "
+        f"FROM settlement s WHERE {cond} "
+        f"GROUP BY CASE WHEN s.group_id IS NULL THEN '散客' ELSE '团体' END "
+        f"ORDER BY amount DESC", params)
+
+    unsettled = db.query_value(
+        "SELECT COUNT(*) FROM room_order "
+        "WHERE status <> 'cancelled' AND settlement_no IS NULL", None, 0)
+
+    return {
+        "bill_count": int(head.get("bill_count") or 0),
+        "room_count": int(head.get("room_count") or 0),
+        "total_amount": float(head.get("total_amount") or 0),
+        "walkin_count": int(head.get("walkin_count") or 0),
+        "group_count": int(head.get("group_count") or 0),
+        "avg_bill": (round(float(head.get("total_amount") or 0)
+                           / int(head.get("bill_count") or 1), 2)),
+        "refunded_count": int(refunded.get("cnt") or 0),
+        "refunded_amount": float(refunded.get("amount") or 0),
+        "unsettled_orders": int(unsettled or 0),
+        "by_method": by_method,
+        "by_day": by_day,
+        "by_operator": by_operator,
+        "by_type": by_type,
+    }

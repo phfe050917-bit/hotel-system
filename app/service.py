@@ -3,7 +3,7 @@
 
 原系统把业务规则直接写在 Tkinter 回调里，三端各写一份，导致：
   · 订单汇总逻辑重复三遍，客人端那份还用 BST 排序造成静默丢单；
-  · 状态流转没有校验，可以从"等待取衣"直接跳到"已送达"；
+  · 状态流转没有校验，可以从"待入住"直接跳到"已退房"；
   · 容量校验、日期校验散落在各处，且失败时抛未捕获异常。
 
 本模块把规则集中到一处，界面只负责收集输入与展示结果。
@@ -14,19 +14,19 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
-from typing import Iterable, Sequence
+from typing import Any, Sequence
 
 from app.db import Database, DatabaseError, Transaction
 from app.ids import new_order_id, uniqueness_guard
 from app.security import hash_password, needs_rehash, verify_password
 
-# --- 各表主键列名（多态操作时用） -------------------------------------
+# --- 各表主键列名（订单通用操作时用） ---------------------------------
+#    原设计覆盖客房/餐饮/健身/SPA/洗衣 5 条业务线；按课程题目
+#    （选题19 宾馆客房管理系统）已收敛为客房主线，因此只剩 room 一项。
+#    "订单类型 -> (表名, 主键列)" 的映射结构保留：以后要加业务线，
+#    只需在这里登记一行，通用操作（查询/流转/取消/支付）无需改动。
 _ORDER_TABLE = {
     "room": ("room_order", "order_id"),
-    "dining": ("dining_order", "order_id"),
-    "fitness": ("fitness_booking", "booking_id"),
-    "spa": ("spa_booking", "booking_id"),
-    "laundry": ("laundry_order", "order_id"),
 }
 
 # 各订单类型可用的状态机：当前状态 -> 允许到达的状态集合
@@ -37,48 +37,11 @@ _TRANSITIONS: dict[str, dict[str, set[str]]] = {
         "checked_out": set(),
         "cancelled":   set(),
     },
-    "dining": {
-        "confirmed": {"dining", "completed", "cancelled"},
-        "dining":    {"completed", "cancelled"},
-        "completed": set(),
-        "cancelled": set(),
-    },
-    "fitness": {
-        "confirmed": {"completed", "cancelled"},
-        "completed": set(),
-        "cancelled": set(),
-    },
-    "spa": {
-        "confirmed":   {"in_progress", "completed", "cancelled"},
-        "in_progress": {"completed", "cancelled"},
-        "completed":   set(),
-        "cancelled":   set(),
-    },
-    "laundry": {
-        "pending":    {"picked_up", "cancelled"},
-        "picked_up":  {"processing", "delivered", "cancelled"},
-        "processing": {"delivered", "cancelled"},
-        "delivered":  set(),
-        "cancelled":  set(),
-    },
 }
 
 _STATUS_LABEL = {
-    "confirmed": "待确认/待入住", "checked_in": "已入住", "checked_out": "已退房",
-    "dining": "用餐中", "completed": "已完成", "cancelled": "已取消",
-    "in_progress": "服务中", "pending": "等待取衣", "picked_up": "已取衣",
-    "processing": "洗涤中", "delivered": "已送达",
-}
-
-FITNESS_SLOTS = ("06:00-08:00", "08:00-10:00", "10:00-12:00",
-                 "14:00-16:00", "16:00-18:00", "18:00-20:00", "20:00-22:00")
-
-LAUNDRY_SERVICES = {
-    "wash":         ("普通水洗", 25.0, "当日 18:00 前"),
-    "dry_clean":    ("普通干洗", 45.0, "次日 12:00 前"),
-    "iron":         ("熨烫服务", 20.0, "当日 16:00 前"),
-    "express_wash": ("加急水洗", 50.0, "4 小时内"),
-    "express_dry":  ("加急干洗", 80.0, "6 小时内"),
+    "confirmed": "待确认/待入住", "checked_in": "已入住",
+    "checked_out": "已退房", "cancelled": "已取消",
 }
 
 PAYMENT_METHODS = ("cash", "card", "wechat", "alipay", "room_charge")
@@ -111,6 +74,7 @@ def parse_date(text: str, field: str = "日期") -> date:
 
 
 def parse_positive_int(text: str, field: str, *, maximum: int | None = None) -> int:
+    """解析正整数（供"人数/数量"类输入使用），并可限定上限。"""
     try:
         value = int(str(text).strip())
     except (TypeError, ValueError):
@@ -120,27 +84,6 @@ def parse_positive_int(text: str, field: str, *, maximum: int | None = None) -> 
     if maximum is not None and value > maximum:
         raise BusinessError(f"{field}不能超过 {maximum}")
     return value
-
-
-def parse_time(text: str, field: str = "时间") -> str:
-    """把 HH:MM 规范化为 HH:MM:SS，供 TIME 列使用。"""
-    if not text or not str(text).strip():
-        raise BusinessError(f"请选择{field}")
-    raw = str(text).strip()
-    for fmt in ("%H:%M", "%H:%M:%S"):
-        try:
-            return datetime.strptime(raw, fmt).strftime("%H:%M:%S")
-        except ValueError:
-            continue
-    raise BusinessError(f"{field}格式不正确，应形如 14:30")
-
-
-def _to_datetime(value, field: str = "时间") -> datetime | None:
-    """把用户选择的取衣时间转换为 DATETIME。'立即取衣' 返回 None。"""
-    if not value or value == "立即取衣":
-        return None
-    parsed = parse_time(value, field)
-    return datetime.combine(date.today(), datetime.strptime(parsed, "%H:%M:%S").time())
 
 
 # =====================================================================
@@ -300,7 +243,8 @@ def search_available_rooms(db: Database, check_in: date, check_out: date,
 
 
 def create_room_order(db: Database, *, user_id: int, room_id: int, check_in: date,
-                      check_out: date, guest_name: str, guest_phone: str = "") -> dict:
+                      check_out: date, guest_name: str, guest_phone: str = "",
+                      id_card: str = "") -> dict:
     """
     创建客房订单。
 
@@ -350,10 +294,12 @@ def create_room_order(db: Database, *, user_id: int, room_id: int, check_in: dat
             nights = (check_out - check_in).days
             tx.execute(
                 "INSERT INTO room_order (order_id, user_id, room_id, check_in_date, "
-                "check_out_date, nights, total_price, guest_name, guest_phone, status) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'confirmed')",
+                "check_out_date, nights, total_price, guest_name, guest_phone, "
+                "id_card, status) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'confirmed')",
                 (order_id, user_id, room_id, check_in, check_out, nights,
-                 float(room["price"]) * nights, guest_name, guest_phone or None),
+                 float(room["price"]) * nights, guest_name, guest_phone or None,
+                 id_card.strip() or None),
             )
             # 触发器已重算金额，这里回读数据库的最终结果用于展示
             saved = tx.query_one(
@@ -376,435 +322,6 @@ def room_calendar(db: Database, room_id: int) -> list[dict]:
         "ORDER BY ro.check_in_date",
         (room_id,),
     )
-
-
-# =====================================================================
-#  餐饮业务
-# =====================================================================
-def list_menu(db: Database, restaurant_id: int) -> list[dict]:
-    """餐厅菜单，带分类名与分类层级，体现 dish_category 的树形结构。"""
-    return db.query(
-        "SELECT d.dish_id, d.dish_name, d.price, d.description, d.is_setmeal, "
-        "       d.is_available, c.category_name, p.category_name AS parent_category "
-        "FROM dish d "
-        "LEFT JOIN dish_category c ON c.category_id = d.category_id "
-        "LEFT JOIN dish_category p ON p.category_id = c.parent_id "
-        "WHERE d.restaurant_id = %s "
-        "ORDER BY COALESCE(p.category_id, c.category_id), c.category_id, d.dish_name",
-        (restaurant_id,),
-    )
-
-
-def create_dining_order(db: Database, *, user_id: int, restaurant_id: int,
-                        dining_date: date, dining_time: str, guest_count: int,
-                        items: Sequence[tuple[int, int]] | None = None) -> dict:
-    """
-    创建餐饮订单，可同时提交菜品明细。
-
-    原实现 total_price 写死 0 且永不更新，管理端"餐饮收入"因此恒为 0。
-    现在明细写入后由触发器自动汇总订单金额。
-    items: [(dish_id, quantity), ...]
-    """
-    if dining_date < date.today():
-        raise BusinessError("用餐日期不能早于今天")
-    if guest_count <= 0:
-        raise BusinessError("用餐人数必须大于 0")
-
-    time_value = parse_time(dining_time, "用餐时间")
-
-    try:
-        with db.transaction() as tx:
-            # 同餐厅同一时间段的座位数上限校验（按 20 桌估算）
-            booked = tx.query_value(
-                "SELECT COUNT(*) FROM dining_order "
-                "WHERE restaurant_id = %s AND dining_date = %s AND dining_time = %s "
-                "  AND status <> 'cancelled'",
-                (restaurant_id, dining_date, time_value), 0)
-            if booked >= 20:
-                raise BusinessError("该时段餐位已订满，请选择其他时间")
-
-            table_number = _allocate_table(tx, restaurant_id, dining_date, time_value)
-
-            order_id = uniqueness_guard(
-                lambda: new_order_id("dining"),
-                lambda oid: bool(tx.query_value(
-                    "SELECT COUNT(*) FROM dining_order WHERE order_id = %s", (oid,), 0)),
-            )
-
-            tx.execute(
-                "INSERT INTO dining_order (order_id, user_id, restaurant_id, table_number, "
-                "dining_date, dining_time, guest_count, total_price, status) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, 0, 'confirmed')",
-                (order_id, user_id, restaurant_id, table_number,
-                 dining_date, time_value, guest_count),
-            )
-
-            for dish_id, quantity in (items or []):
-                if quantity <= 0:
-                    continue
-                dish = tx.query_one(
-                    "SELECT price, is_available FROM dish WHERE dish_id = %s "
-                    "AND restaurant_id = %s", (dish_id, restaurant_id))
-                if dish is None:
-                    raise BusinessError(f"菜品 {dish_id} 不属于该餐厅")
-                if not dish["is_available"]:
-                    raise BusinessError("所选菜品已下架")
-                tx.execute(
-                    "INSERT INTO dining_order_item (order_id, dish_id, quantity, unit_price, subtotal) "
-                    "VALUES (%s, %s, %s, %s, 0)",
-                    (order_id, dish_id, quantity, dish["price"]),
-                )
-
-            saved = tx.query_one(
-                "SELECT order_id, table_number, total_price, status FROM dining_order "
-                "WHERE order_id = %s", (order_id,))
-            return dict(saved)
-    except DatabaseError as exc:
-        raise BusinessError(f"餐饮预订失败：{exc}") from exc
-
-
-def _allocate_table(tx: Transaction, restaurant_id: int, dining_date: date,
-                    dining_time: str) -> str:
-    """
-    分配桌号：取该餐厅该时段尚未占用的最小桌号。
-
-    原实现是 f"{restaurant_id}号桌" —— 无论订多少次都是同一张桌子，
-    等于没有桌位概念。现在按 1..20 号桌做真实占用检查。
-    """
-    used = {
-        row["table_number"]
-        for row in tx.query(
-            "SELECT table_number FROM dining_order "
-            "WHERE restaurant_id = %s AND dining_date = %s AND dining_time = %s "
-            "  AND status <> 'cancelled'",
-            (restaurant_id, dining_date, dining_time),
-        )
-    }
-    for number in range(1, 21):
-        candidate = f"{number:02d}号桌"
-        if candidate not in used:
-            return candidate
-    raise BusinessError("该时段已无空桌")
-
-
-def dining_order_items(db: Database, order_id: str) -> list[dict]:
-    return db.query(
-        "SELECT i.item_id, i.dish_id, d.dish_name, i.quantity, i.unit_price, i.subtotal "
-        "FROM dining_order_item i JOIN dish d ON d.dish_id = i.dish_id "
-        "WHERE i.order_id = %s ORDER BY i.item_id",
-        (order_id,),
-    )
-
-
-# =====================================================================
-#  健身业务
-# =====================================================================
-def fitness_usage(db: Database, booking_date: date) -> list[dict]:
-    """某日各设施各时段的使用情况，容量判断与预约使用同一套口径。"""
-    rows = db.query(
-        "SELECT f.facility_id, f.facility_name, f.capacity, f.location, "
-        "       COALESCE(SUM(b.guest_count), 0) AS booked "
-        "FROM fitness_facility f "
-        "LEFT JOIN fitness_booking b "
-        "       ON b.facility_id = f.facility_id "
-        "      AND b.booking_date = %s AND b.status = 'confirmed' "
-        "WHERE f.status = 'available' "
-        "GROUP BY f.facility_id, f.facility_name, f.capacity, f.location "
-        "ORDER BY f.facility_id",
-        (booking_date,),
-    )
-    usage: list[dict] = []
-    for row in rows:
-        for slot in FITNESS_SLOTS:
-            usage.append({**row, "time_slot": slot})
-    # 逐时段补充已预约人数（单条聚合查询即可，避免 N×M 次往返）
-    detail = db.query(
-        "SELECT facility_id, time_slot, SUM(guest_count) AS booked "
-        "FROM fitness_booking "
-        "WHERE booking_date = %s AND status = 'confirmed' "
-        "GROUP BY facility_id, time_slot",
-        (booking_date,),
-    )
-    booked_map = {(d["facility_id"], d["time_slot"]): int(d["booked"] or 0) for d in detail}
-    for item in usage:
-        item["booked"] = booked_map.get((item["facility_id"], item["time_slot"]), 0)
-        item["remaining"] = max(0, int(item["capacity"]) - item["booked"])
-        item["available"] = item["remaining"] > 0
-    return usage
-
-
-def create_fitness_booking(db: Database, *, user_id: int, facility_id: int,
-                           booking_date: date, time_slot: str, guest_count: int) -> dict:
-    """
-    预约健身设施。
-
-    原实现"先查已约人数、再插入"，两次独立提交之间存在并发窗口，
-    多人同时预约会超卖。现在把复查与插入放进同一事务，
-    并对该设施该时段的既有预约行加锁。
-    """
-    if guest_count <= 0:
-        raise BusinessError("预约人数必须大于 0")
-    if time_slot not in FITNESS_SLOTS:
-        raise BusinessError("请选择有效的时间段")
-
-    try:
-        with db.transaction() as tx:
-            facility = tx.query_one(
-                "SELECT facility_id, facility_name, capacity, status "
-                "FROM fitness_facility WHERE facility_id = %s FOR UPDATE",
-                (facility_id,),
-            )
-            if facility is None:
-                raise BusinessError("设施不存在")
-            if facility["status"] != "available":
-                raise BusinessError(f"{facility['facility_name']} 正在维护中")
-
-            booked = int(tx.query_value(
-                "SELECT COALESCE(SUM(guest_count), 0) FROM fitness_booking "
-                "WHERE facility_id = %s AND booking_date = %s AND time_slot = %s "
-                "  AND status = 'confirmed'",
-                (facility_id, booking_date, time_slot), 0) or 0)
-
-            capacity = int(facility["capacity"])
-            if booked + guest_count > capacity:
-                raise BusinessError(
-                    f"{facility['facility_name']} {booking_date} {time_slot} 仅剩 "
-                    f"{max(0, capacity - booked)} 个名额，无法预约 {guest_count} 人"
-                )
-
-            booking_id = uniqueness_guard(
-                lambda: new_order_id("fitness"),
-                lambda bid: bool(tx.query_value(
-                    "SELECT COUNT(*) FROM fitness_booking WHERE booking_id = %s", (bid,), 0)),
-            )
-            tx.execute(
-                "INSERT INTO fitness_booking (booking_id, user_id, facility_id, "
-                "booking_date, time_slot, guest_count, status) "
-                "VALUES (%s, %s, %s, %s, %s, %s, 'confirmed')",
-                (booking_id, user_id, facility_id, booking_date, time_slot, guest_count),
-            )
-            return {"booking_id": booking_id, "remaining":
-                    max(0, capacity - booked - guest_count)}
-    except DatabaseError as exc:
-        raise BusinessError(f"健身预约失败：{exc}") from exc
-
-
-# =====================================================================
-#  SPA 业务
-# =====================================================================
-def list_technicians(db: Database, service_id: int | None = None) -> list[dict]:
-    """
-    可用技师列表；给定服务时把擅长该项目的技师排在前面。
-
-    注意：SQL 里的字面量百分号必须写成 %% —— pymysql 使用 %s 作为占位符，
-    单个 % 会被当成格式化符号而报 "not enough arguments for format string"。
-    """
-    if service_id:
-        return db.query(
-            "SELECT t.tech_id, t.tech_name, t.tech_level, t.rating, t.specialty, t.status "
-            "FROM technician t "
-            "JOIN spa_service s ON s.service_id = %s "
-            "WHERE t.status <> 'off_duty' "
-            "ORDER BY (t.specialty LIKE CONCAT('%%', s.service_name, '%%')) DESC, "
-            "         t.rating DESC",
-            (service_id,),
-        )
-    return db.query(
-        "SELECT tech_id, tech_name, tech_level, rating, specialty, status "
-        "FROM technician WHERE status <> 'off_duty' ORDER BY rating DESC"
-    )
-
-
-def create_spa_booking(db: Database, *, user_id: int, service_id: int, tech_id: int,
-                       booking_date: date, booking_time: str) -> dict:
-    """
-    预约 SPA。
-
-    原实现既不检查技师是否已被占用，也完全没用 tech_schedule 表。
-    现在：事务内锁定该技师当日排班，占用对应档期，并保证同一技师
-    同一时间不会出现两单。
-    """
-    time_value = parse_time(booking_time, "预约时间")
-    if booking_date < date.today():
-        raise BusinessError("预约日期不能早于今天")
-
-    try:
-        with db.transaction() as tx:
-            service = tx.query_one(
-                "SELECT service_id, service_name, duration, price FROM spa_service "
-                "WHERE service_id = %s FOR UPDATE", (service_id,))
-            if service is None:
-                raise BusinessError("SPA 服务不存在")
-
-            tech = tx.query_one(
-                "SELECT tech_id, tech_name, status FROM technician WHERE tech_id = %s",
-                (tech_id,))
-            if tech is None:
-                raise BusinessError("技师不存在")
-            if tech["status"] == "off_duty":
-                raise BusinessError(f"技师 {tech['tech_name']} 今日休息")
-
-            # 同一技师同一时刻只能有一单有效预约
-            clash = tx.query_one(
-                "SELECT booking_id FROM spa_booking "
-                "WHERE tech_id = %s AND booking_date = %s AND booking_time = %s "
-                "  AND status IN ('confirmed','in_progress') LIMIT 1",
-                (tech_id, booking_date, time_value),
-            )
-            if clash:
-                raise BusinessError(
-                    f"技师 {tech['tech_name']} 在 {booking_date} {time_value[:5]} "
-                    f"已有预约（{clash['booking_id']}），请另选时间或技师"
-                )
-
-            booking_id = uniqueness_guard(
-                lambda: new_order_id("spa"),
-                lambda bid: bool(tx.query_value(
-                    "SELECT COUNT(*) FROM spa_booking WHERE booking_id = %s", (bid,), 0)),
-            )
-            slot = time_value[:5]
-            tx.execute(
-                "INSERT INTO spa_booking (booking_id, user_id, service_id, tech_id, "
-                "booking_date, booking_time, price, status) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, 'confirmed')",
-                (booking_id, user_id, service_id, tech_id, booking_date, time_value,
-                 service["price"]),
-            )
-            # 占用排班档期（若该档期未预先排班则自动补一条，保证 tech_schedule 真正被使用）
-            tx.execute(
-                "INSERT INTO tech_schedule (tech_id, work_date, time_slot, is_booked) "
-                "VALUES (%s, %s, %s, 1) "
-                "ON DUPLICATE KEY UPDATE is_booked = 1",
-                (tech_id, booking_date, slot),
-            )
-            return {"booking_id": booking_id, "price": float(service["price"]),
-                    "tech_name": tech["tech_name"], "service_name": service["service_name"],
-                    "duration": service["duration"]}
-    except DatabaseError as exc:
-        raise BusinessError(f"SPA 预约失败：{exc}") from exc
-
-
-def tech_availability(db: Database, tech_id: int, booking_date: date) -> list[dict]:
-    """某技师某日的档期占用情况，供界面提示可约时段。"""
-    return db.query(
-        "SELECT time_slot, is_booked, "
-        "       CASE WHEN is_booked = 1 THEN '已约' ELSE '空闲' END AS slot_label "
-        "FROM tech_schedule WHERE tech_id = %s AND work_date = %s "
-        "ORDER BY time_slot",
-        (tech_id, booking_date),
-    )
-
-
-# =====================================================================
-#  洗衣业务
-# =====================================================================
-def estimate_laundry(service_type: str, item_count: int) -> dict:
-    """洗衣报价（不落库，供界面实时显示）。"""
-    if service_type not in LAUNDRY_SERVICES:
-        raise BusinessError("请选择洗衣服务类型")
-    if item_count <= 0:
-        raise BusinessError("衣物数量必须大于 0")
-    name, unit_price, eta = LAUNDRY_SERVICES[service_type]
-    return {"service_name": name, "unit_price": unit_price,
-            "total_price": unit_price * item_count, "eta": eta}
-
-
-def create_laundry_order(db: Database, *, user_id: int, service_type: str,
-                         item_count: int, room_number: str,
-                         expected_pickup: str = "立即取衣") -> dict:
-    """
-    洗衣下单。
-
-    原实现让客人自己手填房间号，无法校验；这里改为校验该用户确实
-    有覆盖今天、状态为 confirmed/checked_in 的客房订单，并用订单上的
-    房间号落库，杜绝乱填房号。
-    """
-    if service_type not in LAUNDRY_SERVICES:
-        raise BusinessError("请选择洗衣服务类型")
-    if item_count <= 0:
-        raise BusinessError("衣物数量必须大于 0")
-
-    pickup_at = _to_datetime(expected_pickup, "取衣时间")
-
-    try:
-        with db.transaction() as tx:
-            stay = tx.query_one(
-                "SELECT r.room_number FROM room_order ro "
-                "JOIN room r ON r.room_id = ro.room_id "
-                "WHERE ro.user_id = %s AND ro.status IN ('confirmed','checked_in') "
-                "  AND ro.check_in_date <= CURDATE() AND ro.check_out_date >= CURDATE() "
-                "ORDER BY ro.check_in_date DESC LIMIT 1",
-                (user_id,),
-            )
-            if stay is None:
-                # 允许显式传入房间号（例如为同行亲友下单），但仍需是系统内真实房间
-                if not room_number or not tx.query_value(
-                        "SELECT COUNT(*) FROM room WHERE room_number = %s",
-                        (room_number,), 0):
-                    raise BusinessError(
-                        "当前没有在住/待入住的客房订单，且房间号无效。\n"
-                        "请先预订客房，或填写系统中真实存在的房间号"
-                    )
-            else:
-                room_number = stay["room_number"]
-
-            unit_price = LAUNDRY_SERVICES[service_type][1]
-            order_id = uniqueness_guard(
-                lambda: new_order_id("laundry"),
-                lambda oid: bool(tx.query_value(
-                    "SELECT COUNT(*) FROM laundry_order WHERE order_id = %s", (oid,), 0)),
-            )
-            tx.execute(
-                "INSERT INTO laundry_order (order_id, user_id, service_type, item_count, "
-                "unit_price, total_price, room_number, expected_pickup, status) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'pending')",
-                (order_id, user_id, service_type, item_count, unit_price,
-                 unit_price * item_count, room_number, pickup_at),
-            )
-            return {"order_id": order_id, "room_number": room_number,
-                    "total_price": unit_price * item_count}
-    except DatabaseError as exc:
-        raise BusinessError(f"洗衣下单失败：{exc}") from exc
-
-
-def laundry_queue(db: Database, *, user_id: int | None = None,
-                  include_finished: bool = False) -> list[dict]:
-    """
-    洗衣处理队列，按"加急优先 + 同优先级先到先处理"排序。
-
-    原实现两个问题：
-      1. 客人端把**全部住客**的洗衣订单（含房间号）都查出来显示，泄露隐私；
-      2. 用 PriorityQueue 排序，但堆里比较的是 (priority, dict)，
-         同优先级时顺序不稳定，所谓"同优先级按时间先后"并不成立。
-    现在：客人端必须传 user_id 只看自己的单；排序交给 SQL 的
-    ORDER BY 优先级, created_at，结果确定且可解释。
-    """
-    sql = """
-        SELECT lo.order_id, lo.user_id, u.username, lo.service_type, lo.item_count,
-               lo.unit_price, lo.total_price, lo.room_number, lo.expected_pickup,
-               lo.pickup_time, lo.delivery_time, lo.status, lo.created_at,
-               CASE WHEN lo.service_type IN ('express_wash','express_dry')
-                    THEN 1 ELSE 2 END AS priority,
-               CASE lo.service_type
-                    WHEN 'wash' THEN '普通水洗' WHEN 'dry_clean' THEN '普通干洗'
-                    WHEN 'iron' THEN '熨烫服务' WHEN 'express_wash' THEN '加急水洗'
-                    WHEN 'express_dry' THEN '加急干洗' END AS service_label,
-               CASE lo.status
-                    WHEN 'pending' THEN '等待取衣' WHEN 'picked_up' THEN '已取衣'
-                    WHEN 'processing' THEN '洗涤中' WHEN 'delivered' THEN '已送达'
-                    WHEN 'cancelled' THEN '已取消' END AS status_label
-        FROM laundry_order lo
-        JOIN `user` u ON u.user_id = lo.user_id
-        WHERE 1 = 1
-    """
-    params: list = []
-    if user_id is not None:
-        sql += " AND lo.user_id = %s"
-        params.append(user_id)
-    if not include_finished:
-        sql += " AND lo.status <> 'cancelled'"
-    sql += " ORDER BY priority, lo.created_at, lo.order_id"
-    return db.query(sql, params)
 
 
 # =====================================================================
@@ -895,10 +412,20 @@ def cancel_order(db: Database, order_type: str, order_id: str,
     取消订单。
 
     原实现允许任何角色取消任何状态的订单，包括已完成的。现在：
-      · 走状态机，只有"进行中"的订单可取消；
-      · 已退房/已送达/已完成的订单一律拒绝。
+      · 走状态机，只有"进行中"的订单可取消，已完成的一律拒绝；
+      · 已结账的订单必须先办理「结账单退款」，不能直接取消
+        （数据库层还有 trg_room_order_before_update 兜底）。
     退回的款项（若已支付）记录一条 refunded 流水。
     """
+    if order_type == "room":
+        settled = db.query_value(
+            "SELECT settlement_no FROM room_order WHERE order_id = %s",
+            (order_id,), None)
+        if settled:
+            raise BusinessError(
+                f"该订单已包含在结账单 {settled} 中，不能直接取消。\n"
+                f"请先办理「结账单退款」，再按状态机处理订单。")
+
     label = advance_order_status(db, order_type, order_id, "cancelled")
 
     paid = db.query_one(
@@ -1021,60 +548,6 @@ RESOURCE_CATALOG: dict[str, dict] = {
                                                        "cleaning", "maintenance")),
         ),
     },
-    "restaurant": {
-        "label": "餐厅", "pk": "restaurant_id",
-        "fields": (
-            FieldSpec("restaurant_id", "ID", 50, "int", editable=False),
-            FieldSpec("restaurant_name", "餐厅名称", 140),
-            FieldSpec("location", "位置", 130),
-            FieldSpec("open_time", "营业时间", 240),
-            FieldSpec("description", "描述", 220),
-        ),
-    },
-    "dish": {
-        "label": "菜品", "pk": "dish_id",
-        "fields": (
-            FieldSpec("dish_id", "ID", 50, "int", editable=False),
-            FieldSpec("restaurant_id", "餐厅ID", 70, "int"),
-            FieldSpec("category_id", "分类ID", 70, "int"),
-            FieldSpec("dish_name", "菜名", 140),
-            FieldSpec("price", "价格", 80, "decimal"),
-            FieldSpec("is_setmeal", "套餐(0/1)", 80, "bool"),
-            FieldSpec("is_available", "在售(0/1)", 80, "bool"),
-        ),
-    },
-    "fitness_facility": {
-        "label": "健身设施", "pk": "facility_id",
-        "fields": (
-            FieldSpec("facility_id", "ID", 50, "int", editable=False),
-            FieldSpec("facility_name", "设施名称", 120),
-            FieldSpec("location", "位置", 110),
-            FieldSpec("capacity", "容量", 70, "int"),
-            FieldSpec("open_time", "开放时间", 140),
-            FieldSpec("status", "状态", 120, choices=("available", "maintenance")),
-        ),
-    },
-    "spa_service": {
-        "label": "SPA服务", "pk": "service_id",
-        "fields": (
-            FieldSpec("service_id", "ID", 50, "int", editable=False),
-            FieldSpec("service_name", "服务名称", 150),
-            FieldSpec("duration", "时长(分)", 80, "int"),
-            FieldSpec("price", "价格", 80, "decimal"),
-            FieldSpec("description", "描述", 240),
-        ),
-    },
-    "technician": {
-        "label": "技师", "pk": "tech_id",
-        "fields": (
-            FieldSpec("tech_id", "ID", 50, "int", editable=False),
-            FieldSpec("tech_name", "姓名", 90),
-            FieldSpec("tech_level", "级别", 80, choices=("普通", "高级", "资深")),
-            FieldSpec("specialty", "擅长项目", 200),
-            FieldSpec("rating", "评分", 70, "decimal"),
-            FieldSpec("status", "状态", 120, choices=("available", "busy", "off_duty")),
-        ),
-    },
 }
 
 
@@ -1132,7 +605,71 @@ def resource_list(db: Database, table: str) -> list[dict]:
     return db.query(f"SELECT * FROM `{table}` ORDER BY `{spec['pk']}`")
 
 
-def resource_create(db: Database, table: str, values: dict) -> None:
+# ---------------------------------------------------------------------
+#  敏感操作的密码支持与留痕（题目要求 (4)）
+#
+#  题目原文：「操作员在密码支持下才可更改房价，房间类型，增加客房」。
+#  这里把"密码支持"实现为 Approval：操作员二次输入自己的登录密码，
+#  服务层用 security.verify_password 校验（哈希比对，不是明文比较），
+#  校验通过才允许改动，并把每个字段的「旧值 → 新值」写进 price_change_log。
+# ---------------------------------------------------------------------
+@dataclass(frozen=True)
+class Approval:
+    """敏感操作的密码凭据。"""
+    operator_id: int
+    operator_name: str
+    password: str
+    reason: str = ""
+
+
+# 需要密码支持的表：房价/房型维护在 room_type，增加客房/改房间在 room
+AUDITED_TABLES = ("room_type", "room")
+
+
+def _require_approval(db: Database, table: str, approval: Approval | None) -> None:
+    if table not in AUDITED_TABLES:
+        return
+    if approval is None:
+        raise BusinessError(
+            "按题目要求，修改房价、房间类型或增加客房必须由操作员在密码支持下进行。\n"
+            "请输入当前账号密码后重试。")
+    stored = db.query_value("SELECT password_hash FROM `user` WHERE user_id = %s",
+                            (approval.operator_id,), None)
+    if not stored:
+        raise BusinessError("操作员账号不存在")
+    if not verify_password(approval.password, stored):
+        raise BusinessError("密码校验未通过，操作已被拒绝")
+
+
+def _same_value(old, new) -> bool:
+    """比较库中旧值与界面新值；数值按数值比较，避免 Decimal 与 float 误判为"有改动"。"""
+    if old is None and new is None:
+        return True
+    if old is None or new is None:
+        return False
+    try:
+        return abs(float(old) - float(new)) < 1e-9
+    except (TypeError, ValueError):
+        return str(old) == str(new)
+
+
+def _write_audit(tx: Transaction, *, table: str, pk_value, target_label: str,
+                 changes: dict, approval: Approval) -> None:
+    """changes: {字段名: (旧值, 新值)}；字段名为 '*' 表示新增/删除整条记录。"""
+    for field, (old, new) in changes.items():
+        tx.execute(
+            "INSERT INTO price_change_log (table_name, pk_value, target_label, "
+            "field_name, old_value, new_value, reason, operator_id, operator_name) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            (table, str(pk_value), (target_label or "")[:100], field,
+             None if old is None else str(old)[:100],
+             None if new is None else str(new)[:100],
+             approval.reason.strip() or None,
+             approval.operator_id, approval.operator_name))
+
+
+def resource_create(db: Database, table: str, values: dict,
+                    *, approval: Approval | None = None) -> None:
     spec = _resource_spec(table)
     fields = [f for f in spec["fields"] if f.editable]
 
@@ -1144,46 +681,114 @@ def resource_create(db: Database, table: str, values: dict) -> None:
     if not any(v is not None for v in payload.values()):
         raise BusinessError("请至少填写一个字段")
 
+    _require_approval(db, table, approval)
+
     columns = ", ".join(f"`{name}`" for name in payload)
     placeholders = ", ".join(["%s"] * len(payload))
     try:
-        db.execute(f"INSERT INTO `{table}` ({columns}) VALUES ({placeholders})",
-                   list(payload.values()))
+        if approval is None:
+            db.execute(f"INSERT INTO `{table}` ({columns}) VALUES ({placeholders})",
+                       list(payload.values()))
+            return
+        with db.transaction() as tx:
+            tx.execute(f"INSERT INTO `{table}` ({columns}) VALUES ({placeholders})",
+                       list(payload.values()))
+            new_pk = tx.query_value("SELECT LAST_INSERT_ID()", None, None)
+            label = payload.get("room_number") or payload.get("type_name") or str(new_pk)
+            summary = "新增：" + ", ".join(f"{k}={v}" for k, v in payload.items()
+                                           if v is not None)
+            _write_audit(tx, table=table, pk_value=new_pk, target_label=str(label),
+                         changes={"*": (None, summary)}, approval=approval)
     except DatabaseError as exc:
         raise BusinessError(f"新增失败：{exc}") from exc
 
 
-def resource_update(db: Database, table: str, pk_value, values: dict) -> None:
-    spec = _resource_spec(table)
-    fields = [f for f in spec["fields"] if f.editable]
+def resource_update(db: Database, table: str, pk_value, values: dict,
+                    *, approval: Approval | None = None) -> None:
+    """
+    修改一条基础资源。
 
-    unknown = set(values) - {f.name for f in fields}
+    values 只需要给出**要改动的字段**（部分更新）：没出现的字段保持原值。
+    这样"只改房价"不会把描述、设施等无关字段一起写成 NULL，
+    审计日志里也只会出现真正变化的字段。
+    """
+    spec = _resource_spec(table)
+    fields = {f.name: f for f in spec["fields"] if f.editable}
+
+    unknown = set(values) - set(fields)
     if unknown:
         raise BusinessError(f"存在不可编辑字段：{'、'.join(sorted(unknown))}")
+    if not values:
+        raise BusinessError("请至少提供一个要改动的字段")
 
-    payload = {f.name: _coerce(f, values.get(f.name)) for f in fields}
+    payload = {name: _coerce(fields[name], values.get(name)) for name in values}
+    _require_approval(db, table, approval)
+
     assignments = ", ".join(f"`{name}`=%s" for name in payload)
     try:
-        affected = db.execute(
-            f"UPDATE `{table}` SET {assignments} WHERE `{spec['pk']}`=%s",
-            [*payload.values(), pk_value])
+        if approval is None:
+            affected = db.execute(
+                f"UPDATE `{table}` SET {assignments} WHERE `{spec['pk']}`=%s",
+                [*payload.values(), pk_value])
+            if affected != 1:
+                raise BusinessError("记录不存在，或内容没有变化")
+            return
+
+        with db.transaction() as tx:
+            before = tx.query_one(
+                f"SELECT * FROM `{table}` WHERE `{spec['pk']}`=%s FOR UPDATE",
+                (pk_value,))
+            if before is None:
+                raise BusinessError("记录不存在")
+
+            affected = tx.execute(
+                f"UPDATE `{table}` SET {assignments} WHERE `{spec['pk']}`=%s",
+                [*payload.values(), pk_value])
+            if affected != 1:
+                raise BusinessError("内容没有变化，未产生任何改动")
+
+            changes = {name: (before.get(name), new) for name, new in payload.items()
+                       if not _same_value(before.get(name), new)}
+            if changes:
+                label = (before.get("room_number") or before.get("type_name")
+                         or str(pk_value))
+                _write_audit(tx, table=table, pk_value=pk_value,
+                             target_label=str(label), changes=changes,
+                             approval=approval)
     except DatabaseError as exc:
         raise BusinessError(f"保存失败：{exc}") from exc
-    if affected != 1:
-        raise BusinessError("记录不存在，或内容没有变化")
 
 
-def resource_delete(db: Database, table: str, pk_value) -> None:
+def resource_delete(db: Database, table: str, pk_value,
+                    *, approval: Approval | None = None) -> None:
     """
     删除一条基础资源。
 
-    订单类外键为 RESTRICT，因此删除被引用的房型/房间/菜品时
+    订单类外键为 RESTRICT，因此删除被引用的房型/房间时
     数据库会拒绝，这里把原因翻译成人能读懂的提示。
     """
     spec = _resource_spec(table)
+    _require_approval(db, table, approval)
+
     try:
-        affected = db.execute(f"DELETE FROM `{table}` WHERE `{spec['pk']}`=%s",
-                              (pk_value,))
+        if approval is None:
+            affected = db.execute(f"DELETE FROM `{table}` WHERE `{spec['pk']}`=%s",
+                                  (pk_value,))
+        else:
+            with db.transaction() as tx:
+                before = tx.query_one(
+                    f"SELECT * FROM `{table}` WHERE `{spec['pk']}`=%s FOR UPDATE",
+                    (pk_value,))
+                if before is None:
+                    raise BusinessError("记录不存在")
+                affected = tx.execute(f"DELETE FROM `{table}` WHERE `{spec['pk']}`=%s",
+                                      (pk_value,))
+                label = (before.get("room_number") or before.get("type_name")
+                         or str(pk_value))
+                _write_audit(tx, table=table, pk_value=pk_value,
+                             target_label=str(label),
+                             changes={"*": (str(before), "删除")},
+                             approval=approval)
     except DatabaseError as exc:
         raise BusinessError(
             f"删除失败：该{spec['label']}被其他数据引用，数据库已阻止删除。\n"
@@ -1191,6 +796,29 @@ def resource_delete(db: Database, table: str, pk_value) -> None:
         ) from exc
     if affected != 1:
         raise BusinessError("记录不存在")
+
+
+def list_price_change_logs(db: Database, *, limit: int = 200,
+                           table: str = "") -> list[dict]:
+    """价格/房型变更审计记录（管理端展示）。"""
+    sql = ("SELECT l.log_id, l.table_name, l.pk_value, l.target_label, l.field_name, "
+           "       l.old_value, l.new_value, l.reason, l.operator_name, l.changed_at, "
+           "       CASE l.table_name WHEN 'room_type' THEN '房型' WHEN 'room' THEN '房间' "
+           "            ELSE l.table_name END AS table_label, "
+           "       CASE l.field_name WHEN 'price' THEN '房价' "
+           "            WHEN 'type_name' THEN '房型名称' WHEN 'max_occupancy' THEN '最大入住' "
+           "            WHEN 'room_number' THEN '房间号' WHEN 'floor' THEN '楼层' "
+           "            WHEN 'type_id' THEN '房型ID' WHEN 'status' THEN '房间状态' "
+           "            WHEN 'facilities' THEN '设施' WHEN 'description' THEN '描述' "
+           "            WHEN '*' THEN '整条记录' ELSE l.field_name END AS field_label "
+           "FROM price_change_log l WHERE 1 = 1")
+    params: list = []
+    if table:
+        sql += " AND l.table_name = %s"
+        params.append(table)
+    sql += " ORDER BY l.changed_at DESC, l.log_id DESC LIMIT %s"
+    params.append(int(limit))
+    return db.query(sql, params)
 
 
 def schema_object_names(db: Database) -> dict:
@@ -1245,8 +873,6 @@ def pay_order(db: Database, *, order_type: str, order_id: str, user_id: int,
         raise BusinessError("请选择有效的支付方式")
 
     table, id_column = _ORDER_TABLE[order_type]
-    if order_type in ("fitness",):
-        raise BusinessError("健身预约免费，无需支付")
 
     try:
         with db.transaction() as tx:
@@ -1288,9 +914,7 @@ def pay_order(db: Database, *, order_type: str, order_id: str, user_id: int,
 def list_payments(db: Database, *, user_id: int | None = None,
                   order_type: str | None = None) -> list[dict]:
     sql = ("SELECT p.*, u.username, "
-           "CASE p.order_type WHEN 'room' THEN '客房' WHEN 'dining' THEN '餐饮' "
-           "WHEN 'fitness' THEN '健身' WHEN 'spa' THEN 'SPA' WHEN 'laundry' THEN '洗衣' "
-           "END AS type_label, "
+           "CASE p.order_type WHEN 'room' THEN '客房' END AS type_label, "
            "CASE p.method WHEN 'cash' THEN '现金' WHEN 'card' THEN '银行卡' "
            "WHEN 'wechat' THEN '微信' WHEN 'alipay' THEN '支付宝' "
            "WHEN 'room_charge' THEN '挂房账' END AS method_label "
@@ -1351,9 +975,7 @@ def list_reviews(db: Database, *, limit: int | None = None) -> list[dict]:
     sql = """
         SELECT r.review_id, r.order_id, r.order_type, r.rating, r.content, r.created_at,
                u.username, u.real_name,
-               CASE r.order_type WHEN 'room' THEN '客房' WHEN 'dining' THEN '餐饮'
-                    WHEN 'fitness' THEN '健身' WHEN 'spa' THEN 'SPA'
-                    WHEN 'laundry' THEN '洗衣' END AS type_label
+               CASE r.order_type WHEN 'room' THEN '客房' END AS type_label
         FROM review r JOIN `user` u ON u.user_id = r.user_id
         ORDER BY r.created_at DESC, r.review_id DESC
     """
@@ -1425,28 +1047,6 @@ def room_type_options(db: Database) -> list[dict]:
                     "ORDER BY price")
 
 
-def restaurant_options(db: Database) -> list[dict]:
-    """餐厅下拉选项（含位置与营业时间，供界面展示）。"""
-    return db.query(
-        "SELECT restaurant_id, restaurant_name, location, open_time "
-        "FROM restaurant ORDER BY restaurant_id")
-
-
-def spa_service_options(db: Database) -> list[dict]:
-    return db.query(
-        "SELECT service_id, service_name, price, duration, description "
-        "FROM spa_service ORDER BY service_id")
-
-
-def fitness_facility_options(db: Database, *, only_available: bool = True) -> list[dict]:
-    sql = ("SELECT facility_id, facility_name, capacity, location, open_time, status "
-           "FROM fitness_facility")
-    if only_available:
-        sql += " WHERE status = 'available'"
-    sql += " ORDER BY facility_id"
-    return db.query(sql)
-
-
 def room_floors(db: Database) -> list[int]:
     """所有楼层号，供前台按楼层筛选。"""
     return [int(row["floor"]) for row in db.query(
@@ -1516,3 +1116,503 @@ def admin_reset_password(db: Database, user_id: int, new_password: str) -> None:
                           (hash_password(new_password), user_id))
     if affected != 1:
         raise BusinessError("用户不存在")
+
+
+# =====================================================================
+#  团体登记 / 团体入住 / 团体结账（题目要求 (1)）
+# =====================================================================
+GROUP_STATUS_LABEL = {
+    "reserved": "已登记", "checked_in": "已入住",
+    "checked_out": "已退房", "cancelled": "已取消",
+}
+SETTLEMENT_STATUS_LABEL = {"settled": "已结账", "refunded": "已退款"}
+
+
+def _new_no(tx: Transaction, order_type: str, table: str, column: str) -> str:
+    """事务内生成唯一单号（毫秒时间戳 + 4 位随机 + 冲突重试）。"""
+    def exists(candidate: str) -> bool:
+        return bool(tx.query_value(
+            f"SELECT COUNT(*) FROM `{table}` WHERE `{column}` = %s", (candidate,), 0))
+    return uniqueness_guard(lambda: new_order_id(order_type), exists)
+
+
+def create_group_booking(db: Database, *, group_name: str, contact_name: str,
+                         booker_user_id: int, check_in: date, check_out: date,
+                         room_ids: Sequence[int], contact_phone: str = "",
+                         id_card: str = "", leader_user_id: int | None = None,
+                         remark: str = "") -> dict:
+    """
+    团体登记：一次为多间房生成同一张团体单下的客房订单。
+
+    校验全部在同一个事务里完成，避免"查完再插"的并发窗口：
+      · 团体名称/联系人/日期合法，且同名团体同一天不重复登记；
+      · 至少选一间房、不能重复选同一间；
+      · 每间房在该日期段内没有冲突订单（SELECT ... FOR UPDATE 复查）。
+
+    金额与晚数仍由数据库触发器按当前房价重算，界面传什么都不影响账目。
+    团体单未指定负责人账号时，订单记在 booker_user_id（登记操作员）名下，
+    即"前台代客登记"。
+    """
+    name = (group_name or "").strip()
+    contact = (contact_name or "").strip()
+    if not name:
+        raise BusinessError("请填写团体名称")
+    if not contact:
+        raise BusinessError("请填写联系人姓名")
+    if check_out <= check_in:
+        raise BusinessError("离店日期必须晚于入住日期")
+    if check_in < date.today():
+        raise BusinessError("入住日期不能早于今天")
+
+    rooms = list(dict.fromkeys(int(r) for r in (room_ids or [])))
+    if not rooms:
+        raise BusinessError("请至少选择一间房间")
+    if len(rooms) > 50:
+        raise BusinessError("单次团体登记不能超过 50 间房")
+
+    owner = int(leader_user_id or booker_user_id)
+    try:
+        with db.transaction() as tx:
+            if tx.query_value(
+                    "SELECT COUNT(*) FROM guest_group "
+                    "WHERE group_name = %s AND check_in_date = %s",
+                    (name, check_in), 0):
+                raise BusinessError(f"团体「{name}」在 {check_in} 已登记过，请换一个名称")
+
+            tx.execute(
+                "INSERT INTO guest_group (group_name, contact_name, contact_phone, "
+                "id_card, leader_user_id, check_in_date, check_out_date, remark) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                (name, contact, contact_phone.strip() or None, id_card.strip() or None,
+                 leader_user_id, check_in, check_out, remark.strip() or None))
+            group_id = int(tx.query_value(
+                "SELECT group_id FROM guest_group "
+                "WHERE group_name = %s AND check_in_date = %s", (name, check_in), 0))
+
+            order_ids: list[str] = []
+            total_price = 0.0
+            nights = 0
+            for room_id in rooms:
+                conflict = tx.query_one(
+                    "SELECT order_id FROM room_order "
+                    "WHERE room_id = %s AND status IN ('confirmed','checked_in') "
+                    "  AND check_in_date < %s AND check_out_date > %s FOR UPDATE",
+                    (room_id, check_out, check_in))
+                if conflict:
+                    room_no = tx.query_value("SELECT room_number FROM room "
+                                             "WHERE room_id = %s", (room_id,), room_id)
+                    raise BusinessError(
+                        f"房间 {room_no} 在 {check_in} ~ {check_out} 期间已被预订"
+                        f"（订单 {conflict['order_id']}），请重新选择房间")
+
+                order_id = _new_no(tx, "room", "room_order", "order_id")
+                tx.execute(
+                    "INSERT INTO room_order (order_id, user_id, room_id, check_in_date, "
+                    "check_out_date, nights, total_price, guest_name, guest_phone, "
+                    "id_card, group_id) "
+                    "VALUES (%s, %s, %s, %s, %s, 0, 0, %s, %s, %s, %s)",
+                    (order_id, owner, room_id, check_in, check_out, contact,
+                     contact_phone.strip() or None, id_card.strip() or None, group_id))
+                saved = tx.query_one(
+                    "SELECT nights, total_price FROM room_order WHERE order_id = %s",
+                    (order_id,))
+                order_ids.append(order_id)
+                total_price += float(saved["total_price"])
+                nights = int(saved["nights"])
+
+            return {"group_id": group_id, "order_ids": order_ids, "nights": nights,
+                    "room_count": len(order_ids), "total_price": round(total_price, 2)}
+    except DatabaseError as exc:
+        raise BusinessError(f"团体登记失败：{exc}") from exc
+
+
+def list_groups(db: Database, *, keyword: str = "", status: str = "") -> list[dict]:
+    """团体列表：带房间数、总金额、在住间数与已收款间数（一次查询取回）。"""
+    sql = """
+        SELECT g.group_id, g.group_name, g.contact_name, g.contact_phone, g.id_card,
+               g.check_in_date, g.check_out_date, g.status, g.remark, g.created_at,
+               COALESCE(agg.order_count, 0)    AS order_count,
+               COALESCE(agg.total_amount, 0)   AS total_amount,
+               COALESCE(agg.in_house_count, 0) AS in_house_count,
+               COALESCE(agg.room_numbers, '')  AS room_numbers,
+               COALESCE(pay.paid_count, 0)     AS paid_count,
+               COALESCE(pay.settled_count, 0)  AS settled_count
+        FROM guest_group g
+        LEFT JOIN (
+            SELECT ro.group_id,
+                   COUNT(*)                                            AS order_count,
+                   SUM(ro.total_price)                                 AS total_amount,
+                   SUM(CASE WHEN ro.status = 'checked_in' THEN 1 ELSE 0 END)
+                                                                       AS in_house_count,
+                   GROUP_CONCAT(r.room_number ORDER BY r.room_number)  AS room_numbers
+            FROM room_order ro
+            JOIN room r ON r.room_id = ro.room_id
+            WHERE ro.status <> 'cancelled'
+            GROUP BY ro.group_id
+        ) agg ON agg.group_id = g.group_id
+        LEFT JOIN (
+            -- 用 COUNT(DISTINCT 订单) 而不是 SUM(CASE ...)：一张订单可能先后有
+            -- 多条流水（结账 → 退款 → 再结账），直接 SUM 会把同一间房重复计数。
+            SELECT ro.group_id,
+                   COUNT(DISTINCT CASE WHEN p.status = 'paid'
+                                        THEN ro.order_id END)            AS paid_count,
+                   COUNT(DISTINCT CASE WHEN ro.settlement_no IS NOT NULL
+                                        THEN ro.order_id END)            AS settled_count
+            FROM room_order ro
+            LEFT JOIN payment p
+                   ON p.order_type = 'room' AND p.order_id = ro.order_id
+            WHERE ro.status <> 'cancelled'
+            GROUP BY ro.group_id
+        ) pay ON pay.group_id = g.group_id
+        WHERE 1 = 1
+    """
+    params: list = []
+    if keyword:
+        sql += (" AND (g.group_name LIKE %s OR g.contact_name LIKE %s "
+                "OR g.contact_phone LIKE %s OR g.id_card LIKE %s)")
+        params += [f"%{keyword}%"] * 4
+    if status and status in GROUP_STATUS_LABEL:
+        sql += " AND g.status = %s"
+        params.append(status)
+    sql += " ORDER BY g.check_in_date DESC, g.group_id DESC"
+    rows = db.query(sql, params)
+    for row in rows:
+        row["status_label"] = GROUP_STATUS_LABEL.get(row["status"], row["status"])
+        row["bill_label"] = ("未结账" if not row["settled_count"]
+                             else f"已结账 {row['settled_count']} 间")
+    return rows
+
+
+def group_members(db: Database, group_id: int) -> list[dict]:
+    """某团体的成员订单明细（带支付与结账状态）。"""
+    rows = db.query(
+        "SELECT ro.order_id, r.room_number, rt.type_name, ro.guest_name, ro.id_card, "
+        "       ro.check_in_date, ro.check_out_date, ro.nights, ro.total_price, "
+        "       ro.status AS raw_status, ro.settlement_no, "
+        "       CASE ro.status WHEN 'confirmed' THEN '待入住' WHEN 'checked_in' "
+        "            THEN '已入住' WHEN 'checked_out' THEN '已退房' ELSE '已取消' END "
+        "            AS status_label "
+        "FROM room_order ro "
+        "JOIN room r ON r.room_id = ro.room_id "
+        "JOIN room_type rt ON rt.type_id = r.type_id "
+        "WHERE ro.group_id = %s ORDER BY r.room_number, ro.order_id", (group_id,))
+    paid = paid_order_map(db)
+    for row in rows:
+        row["paid_label"] = paid.get(("room", row["order_id"]), "未支付")
+        row["settle_label"] = "已结账" if row["settlement_no"] else "未结账"
+    return rows
+
+
+def _advance_group(db: Database, group_id: int, *, target: str) -> int:
+    """整团推进状态：所有处于前一状态的订单一起流转，并同步团体状态。"""
+    source = "confirmed" if target == "checked_in" else "checked_in"
+    action = "入住" if target == "checked_in" else "退房"
+    try:
+        with db.transaction() as tx:
+            group = tx.query_one("SELECT group_id, status FROM guest_group "
+                                 "WHERE group_id = %s FOR UPDATE", (group_id,))
+            if group is None:
+                raise BusinessError("团体单不存在")
+            if group["status"] == "cancelled":
+                raise BusinessError("该团体单已取消，不能继续办理")
+
+            rows = tx.query("SELECT order_id FROM room_order "
+                            "WHERE group_id = %s AND status = %s FOR UPDATE",
+                            (group_id, source))
+            if not rows:
+                need = "待入住" if target == "checked_in" else "已入住"
+                raise BusinessError(f"该团体没有可办理「{action}」的房间"
+                                    f"（需要处于「{need}」状态的订单）")
+
+            for row in rows:
+                tx.execute("UPDATE room_order SET status = %s "
+                           "WHERE order_id = %s AND status = %s",
+                           (target, row["order_id"], source))
+
+            tx.execute("UPDATE guest_group SET status = %s WHERE group_id = %s",
+                       (target, group_id))
+            return len(rows)
+    except DatabaseError as exc:
+        raise BusinessError(f"团体办理{action}失败：{exc}") from exc
+
+
+def checkin_group(db: Database, group_id: int) -> int:
+    """整团办理入住，返回办理的房间数。"""
+    return _advance_group(db, group_id, target="checked_in")
+
+
+def checkout_group(db: Database, group_id: int) -> int:
+    """整团办理退房，返回办理的房间数（结账是另一步，见 settle_group）。"""
+    return _advance_group(db, group_id, target="checked_out")
+
+
+def _new_settlement(db: Database, *, order_ids: Sequence[str], group_id: int | None,
+                    method: str, operator_id: int | None, remark: str,
+                    source_label: str) -> dict:
+    """
+    结账核心：把若干订单一次结清并生成一张结账单。
+
+    · 已经结过账（settlement_no 非空）的订单会被拒绝，避免一单两结；
+    · 已取消的订单不计入账单；
+    · 订单若已被客人自助付款，则只计入账单金额、不重复收款；
+    · 全程一个事务：锁订单 → 建结账单 → 回填 settlement_no → 逐单登记收款。
+    """
+    if method not in PAYMENT_METHODS:
+        raise BusinessError("请选择有效的结算方式")
+    order_ids = list(dict.fromkeys(order_ids))
+    if not order_ids:
+        raise BusinessError("没有需要结账的订单")
+
+    placeholders = ", ".join(["%s"] * len(order_ids))
+    try:
+        with db.transaction() as tx:
+            rows = tx.query(
+                f"SELECT order_id, user_id, total_price, status, settlement_no "
+                f"FROM room_order WHERE order_id IN ({placeholders}) FOR UPDATE",
+                order_ids)
+            if len(rows) != len(order_ids):
+                raise BusinessError("部分订单不存在，请刷新后重试")
+
+            payable: list[dict] = []
+            owners: set[int] = set()
+            for row in rows:
+                if row["settlement_no"]:
+                    raise BusinessError(
+                        f"订单 {row['order_id']} 已在结账单 {row['settlement_no']} 中，"
+                        f"请勿重复结账")
+                if row["status"] == "cancelled":
+                    continue
+                payable.append(row)
+                owners.add(int(row["user_id"]))
+            if not payable:
+                raise BusinessError("没有需要结账的订单（订单可能都已取消）")
+
+            total = round(sum(float(r["total_price"]) for r in payable), 2)
+            if total <= 0:
+                raise BusinessError("结账金额必须大于 0，请检查订单金额")
+
+            payer = sorted(owners)[0]
+            settlement_no = _new_no(tx, "settlement", "settlement", "settlement_no")
+            tx.execute(
+                "INSERT INTO settlement (settlement_no, group_id, user_id, room_count, "
+                "total_amount, method, operator_id, remark) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                (settlement_no, group_id, payer, len(payable), total, method,
+                 operator_id, remark.strip() or None))
+
+            collected = 0.0
+            for row in payable:
+                tx.execute("UPDATE room_order SET settlement_no = %s WHERE order_id = %s",
+                           (settlement_no, row["order_id"]))
+                already = tx.query_one(
+                    "SELECT payment_id FROM payment WHERE order_type = 'room' "
+                    "AND order_id = %s AND status = 'paid'", (row["order_id"],))
+                if already:
+                    continue                      # 客人已自助付款，不重复收款
+                payment_no = _new_no(tx, "payment", "payment", "payment_no")
+                tx.execute(
+                    "INSERT INTO payment (payment_no, order_id, order_type, user_id, "
+                    "amount, method, status) VALUES (%s, %s, 'room', %s, %s, %s, 'paid')",
+                    (payment_no, row["order_id"], int(row["user_id"]),
+                     float(row["total_price"]), method))
+                collected += float(row["total_price"])
+
+            return {"settlement_no": settlement_no, "room_count": len(payable),
+                    "total_amount": total, "collected": round(collected, 2),
+                    "order_ids": [r["order_id"] for r in payable]}
+    except DatabaseError as exc:
+        raise BusinessError(f"{source_label}失败：{exc}") from exc
+
+
+def settle_group(db: Database, *, group_id: int, method: str = "cash",
+                 operator_id: int | None = None, remark: str = "") -> dict:
+    """团体结账：一次结清整团所有未结账房间，生成一张结账单（题目要求 (1)）。"""
+    group = db.query_one("SELECT group_id, status, group_name FROM guest_group "
+                         "WHERE group_id = %s", (group_id,))
+    if group is None:
+        raise BusinessError("团体单不存在")
+    if group["status"] == "cancelled":
+        raise BusinessError("该团体单已取消，无需结账")
+
+    rows = db.query("SELECT order_id FROM room_order WHERE group_id = %s "
+                    "AND status <> 'cancelled' AND settlement_no IS NULL "
+                    "ORDER BY order_id", (group_id,))
+    if not rows:
+        raise BusinessError("该团体没有需要结账的房间（可能已全部结账或已取消）")
+    return _new_settlement(db, order_ids=[r["order_id"] for r in rows],
+                           group_id=group_id, method=method,
+                           operator_id=operator_id, remark=remark,
+                           source_label="团体结账")
+
+
+def settle_order(db: Database, *, order_id: str, method: str = "cash",
+                 operator_id: int | None = None, remark: str = "") -> dict:
+    """散客结账：一张订单生成一张结账单。"""
+    order = db.query_one("SELECT order_id, group_id, status FROM room_order "
+                         "WHERE order_id = %s", (order_id,))
+    if order is None:
+        raise BusinessError("订单不存在")
+    if order["status"] == "cancelled":
+        raise BusinessError("已取消的订单无需结账")
+    return _new_settlement(db, order_ids=[order_id], group_id=order["group_id"],
+                           method=method, operator_id=operator_id, remark=remark,
+                           source_label="结账")
+
+
+def list_settlements(db: Database, *, start: date | None = None, end: date | None = None,
+                     keyword: str = "", limit: int | None = None) -> list[dict]:
+    """结账单列表（题目要求 (5)：结账报表）。"""
+    sql = """
+        SELECT s.settlement_no, s.group_id, gg.group_name, s.user_id, u.username,
+               s.room_count, s.total_amount, s.method,
+               CASE s.method WHEN 'cash' THEN '现金' WHEN 'card' THEN '银行卡'
+                    WHEN 'wechat' THEN '微信' WHEN 'alipay' THEN '支付宝'
+                    WHEN 'room_charge' THEN '挂房账' END AS method_label,
+               s.operator_id, op.username AS operator_name,
+               s.status, s.settled_at, s.remark,
+               CASE WHEN s.group_id IS NULL THEN '散客' ELSE '团体' END AS bill_type
+        FROM settlement s
+        JOIN `user` u ON u.user_id = s.user_id
+        LEFT JOIN `user` op ON op.user_id = s.operator_id
+        LEFT JOIN guest_group gg ON gg.group_id = s.group_id
+        WHERE 1 = 1
+    """
+    params: list = []
+    if start:
+        sql += " AND s.settled_at >= %s"
+        params.append(start)
+    if end:
+        sql += " AND s.settled_at < DATE_ADD(%s, INTERVAL 1 DAY)"
+        params.append(end)
+    if keyword:
+        sql += (" AND (s.settlement_no LIKE %s OR gg.group_name LIKE %s "
+                "OR u.username LIKE %s)")
+        params += [f"%{keyword}%"] * 3
+    sql += " ORDER BY s.settled_at DESC, s.settlement_no DESC"
+    if limit:
+        sql += " LIMIT %s"
+        params.append(int(limit))
+    rows = db.query(sql, params)
+    for row in rows:
+        row["status_label"] = SETTLEMENT_STATUS_LABEL.get(row["status"], row["status"])
+    return rows
+
+
+def settlement_detail(db: Database, settlement_no: str) -> list[dict]:
+    """结账单明细（一张账单下的每个房间与其收款流水）。"""
+    return db.query(
+        "SELECT * FROM v_settlement_detail WHERE settlement_no = %s "
+        "ORDER BY room_number, order_id", (settlement_no,))
+
+
+def order_settlement(db: Database, order_id: str) -> dict | None:
+    """某订单所属的结账单（订单详情页展示用）。"""
+    return db.query_one(
+        "SELECT s.settlement_no, s.total_amount, s.room_count, s.method, s.status, "
+        "       s.settled_at, s.remark "
+        "FROM settlement s JOIN room_order ro ON ro.settlement_no = s.settlement_no "
+        "WHERE ro.order_id = %s", (order_id,))
+
+
+def refund_settlement(db: Database, *, settlement_no: str,
+                      operator_id: int | None = None, reason: str = "") -> dict:
+    """
+    整单退款。
+
+    把结账单置为已退款、名下收款流水全部置为 refunded，并把成员订单的
+    settlement_no 置回 NULL —— 订单回到「未结账」状态，之后才允许按状态机
+    取消（数据库层的 trg_room_order_before_update 就是按这个顺序放行的）。
+    """
+    try:
+        with db.transaction() as tx:
+            bill = tx.query_one(
+                "SELECT settlement_no, status, room_count, total_amount "
+                "FROM settlement WHERE settlement_no = %s FOR UPDATE",
+                (settlement_no,))
+            if bill is None:
+                raise BusinessError("结账单不存在")
+            if bill["status"] != "settled":
+                raise BusinessError("该结账单已是退款状态，无需重复退款")
+
+            order_count = int(tx.query_value(
+                "SELECT COUNT(*) FROM room_order WHERE settlement_no = %s",
+                (settlement_no,), 0))
+            refunded = tx.execute(
+                "UPDATE payment SET status = 'refunded' WHERE order_type = 'room' "
+                "AND status = 'paid' AND order_id IN ("
+                "    SELECT order_id FROM room_order WHERE settlement_no = %s)",
+                (settlement_no,))
+            tx.execute("UPDATE room_order SET settlement_no = NULL "
+                       "WHERE settlement_no = %s", (settlement_no,))
+            note = ((reason.strip() + " ") if reason.strip() else "") + "整单退款"
+            tx.execute("UPDATE settlement SET status = 'refunded', remark = %s "
+                       "WHERE settlement_no = %s", (note[:200], settlement_no))
+            return {"settlement_no": settlement_no, "order_count": order_count,
+                    "refund_amount": float(bill["total_amount"]),
+                    "refunded_payments": int(refunded)}
+    except DatabaseError as exc:
+        raise BusinessError(f"结账单退款失败：{exc}") from exc
+
+
+# =====================================================================
+#  客人信息多手段查询（题目要求 (3)）
+# =====================================================================
+def search_guest_profile(db: Database, *, keyword: str = "", name: str = "",
+                         phone: str = "", id_card: str = "", room_number: str = "",
+                         order_id: str = "", check_in_from: date | None = None,
+                         check_in_to: date | None = None,
+                         limit: int | None = 300) -> list[dict]:
+    """
+    多手段查询客人信息，条件之间是「与」关系，可任意组合：
+
+      keyword     —— 用户名 / 真实姓名 / 账号手机号 / 证件号 / 入住人姓名 模糊匹配
+      name        —— 客人姓名（账号姓名或入住人姓名）
+      phone       —— 手机号（账号手机号或入住人电话）
+      id_card     —— 证件号
+      room_number —— 房间号（模糊，支持"10"匹配 101/102）
+      order_id    —— 订单号（模糊，支持只记得单号片段）
+      check_in_from / check_in_to —— 入住日期区间
+
+    数据来自 v_guest_profile：以 user 为主体，所以「没下过单的客人」也查得到。
+    """
+    sql = "SELECT * FROM v_guest_profile WHERE 1 = 1"
+    params: list = []
+    if keyword:
+        sql += (" AND (username LIKE %s OR real_name LIKE %s OR phone LIKE %s "
+                "OR id_card LIKE %s OR guest_name LIKE %s OR guest_phone LIKE %s)")
+        params += [f"%{keyword}%"] * 6
+    if name:
+        sql += " AND (real_name LIKE %s OR guest_name LIKE %s)"
+        params += [f"%{name}%"] * 2
+    if phone:
+        sql += " AND (phone LIKE %s OR guest_phone LIKE %s)"
+        params += [f"%{phone}%"] * 2
+    if id_card:
+        sql += " AND id_card LIKE %s"
+        params.append(f"%{id_card}%")
+    if room_number:
+        sql += " AND room_number LIKE %s"
+        params.append(f"%{room_number}%")
+    if order_id:
+        sql += " AND order_id LIKE %s"
+        params.append(f"%{order_id}%")
+    if check_in_from:
+        sql += " AND check_in_date >= %s"
+        params.append(check_in_from)
+    if check_in_to:
+        sql += " AND check_in_date <= %s"
+        params.append(check_in_to)
+    # 有订单的排前面，再按入住日期倒序
+    sql += " ORDER BY (order_id IS NULL), check_in_date DESC, user_id"
+    if limit:
+        sql += " LIMIT %s"
+        params.append(int(limit))
+    return db.query(sql, params)
+
+
+def guest_orders(db: Database, user_id: int) -> list[dict]:
+    """某客人的全部订单（客人查询页双击查看用）。"""
+    return db.query(
+        "SELECT * FROM v_guest_profile "
+        "WHERE user_id = %s AND order_id IS NOT NULL "
+        "ORDER BY check_in_date DESC, order_id DESC", (user_id,))

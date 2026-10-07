@@ -6,12 +6,13 @@ from tkinter import ttk
 
 from app.ui.base import BaseWindow
 from app.ui.admin_tabs import (
-    AboutTab, AdminOrdersTab, RevenueTab, ResourcesTab, UsersTab,
+    AboutTab, AdminOrdersTab, ResourcesTab, RevenueTab, SettlementReportTab,
+    UsersTab,
 )
 
 
 class AdminWindow(BaseWindow):
-    """管理端：数据统计 / 营收分析 / 用户管理 / 资源管理 / 订单总览 / 关于。"""
+    """管理端：数据统计 / 结账报表 / 用户管理 / 资源管理 / 订单总览 / 关于。"""
 
     role_title = "系统管理端"
 
@@ -23,6 +24,7 @@ class AdminWindow(BaseWindow):
         self.notebook.pack(fill="both", expand=True, padx=10, pady=(6, 0))
 
         self.revenue_tab = RevenueTab(self.notebook, self)
+        self.settlement_tab = SettlementReportTab(self.notebook, self)
         self.users_tab = UsersTab(self.notebook, self)
         self.resources_tab = ResourcesTab(self.notebook, self)
         self.orders_tab = AdminOrdersTab(self.notebook, self)
@@ -30,6 +32,7 @@ class AdminWindow(BaseWindow):
 
         for tab, label in (
             (self.revenue_tab, "  数据统计  "),
+            (self.settlement_tab, "  结账报表  "),
             (self.users_tab, "  用户管理  "),
             (self.resources_tab, "  资源管理  "),
             (self.orders_tab, "  订单总览  "),
@@ -51,7 +54,7 @@ class AdminWindow(BaseWindow):
             self.status.show("已刷新（F5）", "success")
 
     def refresh_all(self) -> None:
-        for tab in (self.revenue_tab, self.users_tab, self.resources_tab,
-                    self.orders_tab):
+        for tab in (self.revenue_tab, self.settlement_tab, self.users_tab,
+                    self.resources_tab, self.orders_tab):
             if hasattr(tab, "on_show"):
                 tab.on_show()
